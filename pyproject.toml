@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-voice-agent"
+version = "0.1.0"
+description = "Local-first, provider-neutral framework for adaptive voice conversations"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.scripts]
+adaptive-voice-agent = "speaking_agent.simulator:main"
+adaptive-voice-speech = "speaking_agent.speech_cli:main"
+adaptive-voice-calls = "speaking_agent.operator_cli:main"
+adaptive-voice-local = "speaking_agent.local_voice_chat:main"
+adaptive-voice-retention = "speaking_agent.retention_worker:main"
+speaking-agent = "speaking_agent.simulator:main"
+speaking-agent-speech = "speaking_agent.speech_cli:main"
+speaking-agent-calls = "speaking_agent.operator_cli:main"
+speaking-agent-local = "speaking_agent.local_voice_chat:main"
+speaking-agent-retention = "speaking_agent.retention_worker:main"
+
+[project.optional-dependencies]
+mlx = ["mlx-lm==0.31.3"]
+speech = ["mlx-audio==0.4.8"]
+local = [
+	"mlx-lm==0.31.3",
+	"mlx-audio==0.4.8",
+	"sounddevice==0.5.5",
+]
+livekit = ["livekit-agents==1.6.10"]
+realtime = [
+	"livekit-agents==1.6.10",
+	"mlx-lm==0.31.3",
+	"mlx-audio==0.4.8",
+	"sounddevice==0.5.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
