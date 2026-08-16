@@ -27,6 +27,7 @@ class QwenMlxSpeechSynthesizer:
         model: Any | None = None,
         default_voice: str = "Aiden",
         default_language: str = "English",
+        default_style: str | None = None,
         streaming_interval_seconds: float = 0.32,
         frame_duration_ms: int = 20,
         cancellation_grace_seconds: float = 2.0,
@@ -35,6 +36,7 @@ class QwenMlxSpeechSynthesizer:
         self._model = model
         self.default_voice = default_voice
         self.default_language = default_language
+        self.default_style = default_style
         self.streaming_interval_seconds = streaming_interval_seconds
         self.frame_duration_ms = frame_duration_ms
         self._cancellation_grace_seconds = cancellation_grace_seconds
@@ -85,7 +87,7 @@ class QwenMlxSpeechSynthesizer:
                     lambda: self._model.generate(
                         text=text,
                         voice=options.voice or self.default_voice,
-                        instruct=options.style,
+                        instruct=options.style or self.default_style,
                         lang_code=options.language or self.default_language,
                         stream=True,
                         streaming_interval=self.streaming_interval_seconds,

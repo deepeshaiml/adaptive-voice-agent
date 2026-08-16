@@ -27,6 +27,8 @@ class ConversationState:
     stage: ConversationStage = ConversationStage.OPENING
     outcome: str = "UNKNOWN"
     fields: dict[str, Any] = field(default_factory=dict)
+    recent_owner_utterances: list[str] = field(default_factory=list)
+    recent_dialogue: list[dict[str, str]] = field(default_factory=list)
     skipped_fields: set[str] = field(default_factory=set)
     asked_fields: set[str] = field(default_factory=set)
     asked_field_counts: dict[str, int] = field(default_factory=dict)
@@ -43,6 +45,7 @@ class ConversationState:
 class AgentReply:
     text: str
     action: SessionAction = SessionAction.CONTINUE
+    question_field: str | None = None
 
 
 @dataclass(frozen=True)

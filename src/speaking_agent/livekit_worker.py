@@ -16,6 +16,7 @@ from speaking_agent.adapters.telephony.livekit_room import LiveKitRoomTransport
 from speaking_agent.adapters.tts.qwen_mlx import QwenMlxSpeechSynthesizer
 from speaking_agent.answering import HeuristicAnsweringMachineDetector
 from speaking_agent.campaign import load_campaign
+from speaking_agent.delivery import campaign_voice_style
 from speaking_agent.outbound import (
     DialStatus,
     LiveKitSipDialer,
@@ -116,16 +117,21 @@ async def entrypoint(context: JobContext) -> None:
         hang_up_handler=hang_up,
         transfer_handler=transfer if transfer_to else None,
     )
+    campaign = load_campaign(campaign_path)
     session = CallSession(
-        campaign=(campaign := load_campaign(campaign_path)),
+        campaign=campaign,
         model=QwenMlxConversationModel(MlxLmBackend()),
         recognizer=QwenMlxSpeechRecognizer(),
-        synthesizer=QwenMlxSpeechSynthesizer(),
+        synthesizer=QwenMlxSpeechSynthesizer(
+            default_style=campaign_voice_style(campaign)
+        ),
         transport=transport,
         answering_detector=(
             HeuristicAnsweringMachineDetector() if phone_number else None
         ),
         on_do_not_contact=(persist_do_not_contact if phone_number else None),
+        recognition_language="English",
+        recognition_context=campaign.speech_recognition_context,
         transfer_available=bool(transfer_to),
     )
     legacy_retention = os.environ.get("SPEAKING_AGENT_LEGACY_RETENTION_DAYS")

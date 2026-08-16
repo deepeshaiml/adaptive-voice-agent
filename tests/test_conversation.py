@@ -32,6 +32,57 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.state.fields["selling_timeline"], "in two months")
         self.assertEqual(reply.text, self.campaign.questions["property_location"])
 
+    async def test_model_receives_bounded_prior_dialogue(self) -> None:
+        observed_histories: list[list[str]] = []
+        observed_dialogues: list[list[dict[str, str]]] = []
+
+        class HistoryModel:
+            async def interpret(self, utterance, state, campaign):
+                del utterance, campaign
+                observed_histories.append(list(state.recent_owner_utterances))
+                observed_dialogues.append(list(state.recent_dialogue))
+                return ModelInterpretation(answer="I remember that.")
+
+        campaign = replace(
+            self.campaign,
+            behavior={**self.campaign.behavior, "conversation_memory_turns": 2},
+        )
+        session = ConversationSession(campaign, HistoryModel())
+        session.start()
+
+        await session.receive("First detail")
+        await session.receive("Second detail")
+        await session.receive("What did I say earlier?")
+
+        self.assertEqual(observed_histories[0], [])
+        self.assertEqual(observed_histories[1], ["First detail"])
+        self.assertEqual(
+            observed_histories[2],
+            ["First detail", "Second detail"],
+        )
+        self.assertEqual(
+            observed_dialogues[0],
+            [
+                {
+                    "role": "agent",
+                    "text": session.opening,
+                    "delivery": "delivered",
+                    "question_field": "intent",
+                }
+            ],
+        )
+        self.assertEqual(
+            [turn["role"] for turn in observed_dialogues[2]],
+            ["agent", "owner", "agent", "owner", "agent"],
+        )
+        self.assertEqual(observed_dialogues[2][1]["text"], "First detail")
+        self.assertEqual(observed_dialogues[2][3]["text"], "Second detail")
+        self.assertEqual(
+            session.state.recent_owner_utterances,
+            ["Second detail", "What did I say earlier?"],
+        )
+        self.assertLessEqual(len(session.state.recent_dialogue), 5)
+
     async def test_one_word_both_selects_the_combined_qualified_branch(self) -> None:
         session = ConversationSession(self.campaign, MockConversationModel())
         session.start()
@@ -41,6 +92,26 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.state.outcome, "SELL_OR_RENT")
         self.assertEqual(session.state.fields["intent"], "SELL_OR_RENT")
         self.assertEqual(reply.text, self.campaign.questions["property_location"])
+
+    async def test_explicit_sell_takes_precedence_over_future_timing(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "I might sell next year": ModelInterpretation(
+                        suggested_outcome="FUTURE",
+                        field_updates={"selling_timeline": "next year"},
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        await session.receive("I might sell next year")
+
+        self.assertEqual(session.state.outcome, "SELL")
+        self.assertEqual(session.state.fields["intent"], "SELL")
+        self.assertEqual(session.state.fields["selling_timeline"], "next year")
 
     async def test_hard_stop_is_enforced_without_model_cooperation(self) -> None:
         session = ConversationSession(self.campaign, MockConversationModel())
@@ -52,6 +123,30 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.state.ended)
         self.assertEqual(session.result().outcome, "DO_NOT_CONTACT")
         self.assertEqual(reply.action, SessionAction.HANG_UP)
+
+    async def test_unicode_apostrophe_do_not_contact_is_enforced(self) -> None:
+        session = ConversationSession(self.campaign, MockConversationModel())
+        session.start()
+
+        await session.receive("Please don’t call me again")
+
+        self.assertTrue(session.state.do_not_contact)
+        self.assertEqual(session.result().outcome, "DO_NOT_CONTACT")
+
+        for wording in (
+            "Please do not contact me again",
+            "Please dont call me again",
+        ):
+            with self.subTest(wording=wording):
+                variant = ConversationSession(
+                    self.campaign,
+                    MockConversationModel(
+                        {wording: ModelInterpretation(suggested_outcome="DO_NOT_CONTACT")}
+                    ),
+                )
+                variant.start()
+                await variant.receive(wording)
+                self.assertTrue(variant.state.do_not_contact)
 
     async def test_do_not_contact_takes_precedence_over_other_hard_stops(self) -> None:
         campaign = replace(
@@ -69,6 +164,30 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.result().outcome, "DO_NOT_CONTACT")
         self.assertTrue(session.state.do_not_contact)
 
+        transfer_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+        )
+        transfer_session.start()
+        transfer_reply = await transfer_session.receive(
+            "Do not call me again, connect me to someone"
+        )
+
+        self.assertEqual(transfer_reply.action, SessionAction.HANG_UP)
+        self.assertTrue(transfer_session.state.do_not_contact)
+
+        mixed_timing_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+        )
+        mixed_timing_session.start()
+        mixed_timing_reply = await mixed_timing_session.receive(
+            "Don't call me today or ever again, connect me to someone"
+        )
+
+        self.assertEqual(mixed_timing_reply.action, SessionAction.HANG_UP)
+        self.assertTrue(mixed_timing_session.state.do_not_contact)
+
     async def test_do_not_contact_cannot_be_replaced_by_a_later_hard_stop(self) -> None:
         session = ConversationSession(self.campaign, MockConversationModel())
         session.start()
@@ -82,6 +201,243 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
             reply.text,
             self.campaign.closing_messages["DO_NOT_CONTACT"],
         )
+
+    async def test_temporary_do_not_call_request_is_not_persisted_as_dnc(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "Do not call now, call me tomorrow": ModelInterpretation(
+                        suggested_outcome="CALLBACK",
+                        field_updates={"callback_time": "tomorrow"},
+                        callback_requested=True,
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        await session.receive("Do not call now, call me tomorrow")
+
+        self.assertFalse(session.state.do_not_contact)
+        self.assertEqual(session.result().outcome, "CALLBACK")
+        self.assertEqual(session.result().fields["callback_time"], "tomorrow")
+
+        until_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "Do not call me until tomorrow": ModelInterpretation(
+                        suggested_outcome="DO_NOT_CONTACT"
+                    )
+                }
+            ),
+        )
+        until_session.start()
+
+        await until_session.receive("Do not call me until tomorrow")
+
+        self.assertFalse(until_session.state.do_not_contact)
+        self.assertEqual(until_session.state.outcome, "CALLBACK")
+
+        compact_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "not now, call tomorrow": ModelInterpretation(
+                        suggested_outcome="DO_NOT_CONTACT"
+                    )
+                }
+            ),
+        )
+        compact_session.start()
+
+        await compact_session.receive("not now, call tomorrow")
+
+        self.assertFalse(compact_session.state.do_not_contact)
+        self.assertEqual(compact_session.state.outcome, "CALLBACK")
+        self.assertTrue(compact_session.state.callback_requested)
+
+        marketing_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+        )
+        marketing_session.start()
+
+        await marketing_session.receive("Do not call me for marketing purposes")
+
+        self.assertTrue(marketing_session.state.do_not_contact)
+        self.assertEqual(marketing_session.result().outcome, "DO_NOT_CONTACT")
+
+    async def test_model_only_do_not_contact_without_evidence_is_rejected(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "Yes, that sounds interesting": ModelInterpretation(
+                        suggested_outcome="DO_NOT_CONTACT"
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        await session.receive("Yes, that sounds interesting")
+
+        self.assertFalse(session.state.do_not_contact)
+        self.assertEqual(session.state.outcome, "UNKNOWN")
+
+    async def test_lexical_collisions_do_not_create_property_intent(self) -> None:
+        transfer_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "Please connect me to someone": ModelInterpretation(
+                        suggested_outcome="HUMAN_TRANSFER"
+                    )
+                }
+            ),
+        )
+        transfer_session.start()
+        transfer_reply = await transfer_session.receive("Please connect me to someone")
+
+        neither_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "neither": ModelInterpretation(
+                        suggested_outcome="SELL_OR_RENT"
+                    )
+                }
+            ),
+        )
+        neither_session.start()
+        await neither_session.receive("neither")
+
+        self.assertEqual(transfer_reply.action, SessionAction.TRANSFER)
+        self.assertNotEqual(transfer_session.state.outcome, "RENT")
+        self.assertEqual(neither_session.state.outcome, "UNKNOWN")
+
+        negative_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "negative": ModelInterpretation(
+                        suggested_outcome="SELL_OR_RENT"
+                    )
+                }
+            ),
+        )
+        negative_session.start()
+        await negative_session.receive("I don't want to sell or rent")
+
+        mixed_transfer_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "mixed": ModelInterpretation(suggested_outcome="SELL")
+                }
+            ),
+        )
+        mixed_transfer_session.start()
+        mixed_reply = await mixed_transfer_session.receive(
+            "I want to sell, but connect me to a person"
+        )
+
+        self.assertEqual(negative_session.state.outcome, "UNKNOWN")
+        self.assertEqual(mixed_reply.action, SessionAction.TRANSFER)
+        self.assertEqual(mixed_transfer_session.state.outcome, "HUMAN_TRANSFER")
+
+        rent_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "rent": ModelInterpretation(suggested_outcome="UNKNOWN")
+                }
+            ),
+        )
+        rent_session.start()
+        await rent_session.receive("I wouldn't sell, but I'd rent it")
+
+        annoyed_transfer_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+        )
+        annoyed_transfer_session.start()
+        annoyed_reply = await annoyed_transfer_session.receive(
+            "I'm not interested, connect me to someone"
+        )
+
+        self.assertEqual(rent_session.state.outcome, "RENT")
+        self.assertEqual(annoyed_reply.action, SessionAction.TRANSFER)
+
+        pivot_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {"pivot": ModelInterpretation(suggested_outcome="SELL")}
+            ),
+        )
+        pivot_session.start()
+        await pivot_session.receive("I don't want to rent and would rather sell")
+
+        self.assertEqual(pivot_session.state.outcome, "SELL")
+
+        punctuation_free_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "pivot": ModelInterpretation(suggested_outcome="SELL")
+                }
+            ),
+        )
+        punctuation_free_session.start()
+        await punctuation_free_session.receive("I am not renting I want to sell")
+
+        self.assertEqual(punctuation_free_session.state.outcome, "SELL")
+
+        reverse_pivot_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "pivot": ModelInterpretation(suggested_outcome="RENT")
+                }
+            ),
+        )
+        reverse_pivot_session.start()
+        await reverse_pivot_session.receive("I don't want to sell I'm renting it")
+
+        self.assertEqual(reverse_pivot_session.state.outcome, "RENT")
+
+    async def test_transfer_is_not_enabled_by_wording_when_campaign_omits_it(self) -> None:
+        campaign = replace(
+            self.campaign,
+            desired_outcomes=tuple(
+                outcome
+                for outcome in self.campaign.desired_outcomes
+                if outcome != "HUMAN_TRANSFER"
+            ),
+            terminal_outcomes=tuple(
+                outcome
+                for outcome in self.campaign.terminal_outcomes
+                if outcome != "HUMAN_TRANSFER"
+            ),
+        )
+        session = ConversationSession(
+            campaign,
+            MockConversationModel(
+                {
+                    "transfer": ModelInterpretation(
+                        suggested_outcome="HUMAN_TRANSFER"
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        reply = await session.receive("connect me to someone")
+
+        self.assertEqual(reply.action, SessionAction.CONTINUE)
+        self.assertFalse(session.state.human_transfer_requested)
 
     async def test_answers_question_then_returns_to_objective(self) -> None:
         session = ConversationSession(self.campaign, MockConversationModel())
@@ -99,6 +455,73 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             second_reply.text.endswith(self.campaign.question_variants["intent"][1])
         )
+
+    async def test_clean_faq_turn_bypasses_model_latency(self) -> None:
+        class FailingModel:
+            async def interpret(self, utterance, state, campaign):
+                del utterance, state, campaign
+                raise AssertionError("FAQ-only turn should not call the model")
+
+        session = ConversationSession(self.campaign, FailingModel())
+        session.start()
+
+        reply = await session.receive("How did you get my number?")
+
+        self.assertIn("contact list provided for this test call", reply.text)
+
+    async def test_faq_mixed_with_property_intent_still_uses_model(self) -> None:
+        calls: list[str] = []
+
+        class MixedTurnModel:
+            async def interpret(self, utterance, state, campaign):
+                del state, campaign
+                calls.append(utterance)
+                return ModelInterpretation(suggested_outcome="SELL")
+
+        session = ConversationSession(self.campaign, MixedTurnModel())
+        session.start()
+
+        await session.receive("How did you get my number? I want to sell.")
+
+        self.assertEqual(calls, ["How did you get my number? I want to sell."])
+        self.assertEqual(session.state.outcome, "SELL")
+
+    async def test_transfer_worded_as_faq_bypasses_model_safely(self) -> None:
+        calls: list[str] = []
+
+        class TransferModel:
+            async def interpret(self, utterance, state, campaign):
+                del state, campaign
+                calls.append(utterance)
+                return ModelInterpretation(
+                    suggested_outcome="HUMAN_TRANSFER",
+                    human_transfer_requested=True,
+                )
+
+        session = ConversationSession(self.campaign, TransferModel())
+        session.start()
+
+        reply = await session.receive("Can I speak to a person?")
+
+        self.assertEqual(calls, [])
+        self.assertEqual(reply.action, SessionAction.TRANSFER)
+
+    async def test_compound_faq_and_transfer_turn_prioritizes_transfer(self) -> None:
+        calls: list[str] = []
+
+        class TransferModel:
+            async def interpret(self, utterance, state, campaign):
+                del state, campaign
+                calls.append(utterance)
+                return ModelInterpretation(suggested_outcome="HUMAN_TRANSFER")
+
+        session = ConversationSession(self.campaign, TransferModel())
+        session.start()
+
+        reply = await session.receive("Are you human? Connect me to someone")
+
+        self.assertEqual(calls, [])
+        self.assertEqual(reply.action, SessionAction.TRANSFER)
 
     async def test_acknowledges_an_answer_before_the_next_question(self) -> None:
         session = ConversationSession(
@@ -120,6 +543,116 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
             reply.text,
             f"That makes sense. {self.campaign.questions['property_location']}",
         )
+
+    async def test_repeated_acknowledgement_is_suppressed(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        acknowledgement="Got it.",
+                    ),
+                    "Dubai Marina": ModelInterpretation(
+                        field_updates={"property_location": "Dubai Marina"},
+                        acknowledgement="Got it.",
+                    ),
+                }
+            ),
+        )
+        session.start()
+        first_reply = await session.receive("sell")
+
+        second_reply = await session.receive("Dubai Marina")
+
+        self.assertTrue(first_reply.text.startswith("Got it."))
+        self.assertFalse(second_reply.text.startswith("Got it."))
+
+    async def test_model_can_rephrase_only_the_policy_selected_question(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "I might sell": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        acknowledgement="That makes sense.",
+                        next_question_field="property_location",
+                        next_question="Which part of Dubai is the property in?",
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        reply = await session.receive("I might sell")
+
+        self.assertEqual(
+            reply.text,
+            "That makes sense. Which part of Dubai is the property in?",
+        )
+
+    async def test_unrelated_dynamic_question_uses_campaign_fallback(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "I might sell": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        next_question_field="property_location",
+                        next_question="Which area is your bank located in?",
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        reply = await session.receive("I might sell")
+
+        self.assertEqual(reply.text, self.campaign.questions["property_location"])
+
+    async def test_invalid_dynamic_question_uses_campaign_fallback(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "I might sell": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        next_question_field="property_type",
+                        next_question="Where is it? What type is it?",
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        reply = await session.receive("I might sell")
+
+        self.assertEqual(reply.text, self.campaign.questions["property_location"])
+
+    async def test_mislabeled_dynamic_question_uses_campaign_fallback(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "I might sell my apartment in Dubai Marina next year": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        field_updates={
+                            "property_location": "Dubai Marina",
+                            "selling_timeline": "next year",
+                        },
+                        next_question_field="expected_price",
+                        next_question="Is it an apartment or a villa?",
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        reply = await session.receive(
+            "I might sell my apartment in Dubai Marina next year"
+        )
+
+        self.assertEqual(reply.text, self.campaign.questions["expected_price"])
 
     async def test_model_question_is_removed_before_policy_question(self) -> None:
         session = ConversationSession(
@@ -144,6 +677,49 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             reply.text.endswith(self.campaign.question_variants["intent"][0])
         )
+
+    async def test_unicode_human_identity_claim_is_filtered(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "human": ModelInterpretation(answer="I’m a human.")
+                }
+            ),
+        )
+        session.start()
+
+        reply = await session.receive("human")
+
+        self.assertNotIn("human", reply.text.casefold())
+
+        actual_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "actual": ModelInterpretation(answer="I’m an actual human.")
+                }
+            ),
+        )
+        actual_session.start()
+        actual_reply = await actual_session.receive("actual")
+
+        self.assertNotIn("actual human", actual_reply.text.casefold())
+
+        for unsafe_answer in (
+            "I'm actually a human caller.",
+            "You're talking to a real person.",
+        ):
+            paraphrase_session = ConversationSession(
+                self.campaign,
+                MockConversationModel(
+                    {"unsafe": ModelInterpretation(answer=unsafe_answer)}
+                ),
+            )
+            paraphrase_session.start()
+            paraphrase_reply = await paraphrase_session.receive("unsafe")
+            self.assertNotIn("real person", paraphrase_reply.text.casefold())
+            self.assertNotIn("human caller", paraphrase_reply.text.casefold())
 
     async def test_mid_qualification_question_is_not_stored_as_a_field(self) -> None:
         session = ConversationSession(self.campaign, MockConversationModel())
@@ -379,6 +955,180 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_relational_phrase_is_not_stored_as_property_location(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "name": ModelInterpretation(
+                        field_updates={"property_location": "my wife's name"}
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("My apartment is in my wife's name")
+
+        self.assertNotIn("property_location", session.state.fields)
+
+    async def test_configured_location_hint_is_extracted_deterministically(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {"sell": ModelInterpretation(suggested_outcome="SELL")}
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("The property is in Dubai Marina")
+
+        self.assertEqual(session.state.fields["property_location"], "Dubai Marina")
+
+    async def test_negated_location_hint_is_not_extracted(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {"sell": ModelInterpretation(suggested_outcome="SELL")}
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("The property is not in Dubai Marina")
+
+        self.assertNotIn("property_location", session.state.fields)
+
+    async def test_ungrounded_model_location_is_not_stored(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "unknown": ModelInterpretation(
+                        field_updates={"property_location": "Dubai Marina"}
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("I would rather not say")
+
+        self.assertNotIn("property_location", session.state.fields)
+
+    async def test_ungrounded_model_price_and_boolean_are_not_stored(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "refusal": ModelInterpretation(
+                        field_updates={
+                            "expected_price": "AED 2 million",
+                            "currently_listed": False,
+                        }
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("I would rather not say")
+
+        self.assertNotIn("expected_price", session.state.fields)
+        self.assertNotIn("currently_listed", session.state.fields)
+
+    async def test_model_boolean_requires_deterministic_context(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "Dubai Marina": ModelInterpretation(
+                        field_updates={"property_location": "Dubai Marina"}
+                    ),
+                    "apartment": ModelInterpretation(),
+                    "next year": ModelInterpretation(
+                        field_updates={"selling_timeline": "next year"}
+                    ),
+                    "two million": ModelInterpretation(
+                        field_updates={"expected_price": "two million"}
+                    ),
+                    "no": ModelInterpretation(
+                        field_updates={"currently_listed": True}
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+        await session.receive("Dubai Marina")
+        await session.receive("apartment")
+        await session.receive("next year")
+        await session.receive("two million")
+
+        await session.receive("no")
+
+        self.assertFalse(session.result().fields["currently_listed"])
+
+    async def test_negated_allowed_property_type_is_not_stored(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "negative": ModelInterpretation(
+                        field_updates={"property_type": "apartment"}
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("It is not an apartment")
+
+        self.assertNotIn("property_type", session.state.fields)
+
+        correction_session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {"sell": ModelInterpretation(suggested_outcome="SELL")}
+            ),
+        )
+        correction_session.start()
+        await correction_session.receive("sell")
+
+        await correction_session.receive("It is not an apartment it is a villa")
+
+        self.assertEqual(correction_session.state.fields["property_type"], "villa")
+
+    async def test_location_grounding_does_not_depend_on_hint_configuration(self) -> None:
+        campaign = replace(self.campaign, field_extraction_hints={})
+        session = ConversationSession(
+            campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "refusal": ModelInterpretation(
+                        field_updates={"property_location": "I would rather not say"}
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("I would rather not say")
+
+        self.assertNotIn("property_location", session.state.fields)
+
     async def test_unclear_secondary_field_is_skipped_without_losing_lead(self) -> None:
         session = ConversationSession(
             self.campaign,
@@ -453,6 +1203,77 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.result().fields["property_type"], "flat")
         self.assertEqual(final_reply.action, SessionAction.HANG_UP)
 
+    async def test_allowlisted_value_is_extracted_when_model_only_mentions_it(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell apartment": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        acknowledgement="So you're selling an apartment.",
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        await session.receive("I may sell my apartment")
+
+        self.assertEqual(session.state.fields["property_type"], "apartment")
+
+    async def test_explicit_property_in_area_extracts_location_without_timing(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "volunteered": ModelInterpretation(
+                        suggested_outcome="SELL",
+                        acknowledgement="That helps.",
+                    )
+                }
+            ),
+        )
+        session.start()
+
+        await session.receive(
+            "I might sell my apartment in Dubai Marina next year."
+        )
+
+        self.assertEqual(session.state.fields["property_location"], "Dubai Marina")
+        self.assertEqual(session.state.fields["property_type"], "apartment")
+        self.assertEqual(session.state.fields["selling_timeline"], "next year")
+
+    async def test_contextual_boolean_answer_is_extracted_without_model_update(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "Dubai Marina": ModelInterpretation(
+                        field_updates={"property_location": "Dubai Marina"}
+                    ),
+                    "apartment": ModelInterpretation(),
+                    "two months": ModelInterpretation(
+                        field_updates={"selling_timeline": "two months"}
+                    ),
+                    "two million": ModelInterpretation(
+                        field_updates={"expected_price": "two million"}
+                    ),
+                    "no": ModelInterpretation(),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+        await session.receive("Dubai Marina")
+        await session.receive("apartment")
+        await session.receive("two months")
+        await session.receive("two million")
+
+        await session.receive("no")
+
+        self.assertFalse(session.result().fields["currently_listed"])
+
     async def test_validated_human_transfer_outcome_authorizes_transfer(self) -> None:
         session = ConversationSession(
             self.campaign,
@@ -495,6 +1316,28 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session.state.outcome, "SELL")
         self.assertFalse(session.state.callback_requested)
+
+    async def test_callback_keeps_an_established_property_outcome(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "sell": ModelInterpretation(suggested_outcome="SELL"),
+                    "call me back": ModelInterpretation(
+                        suggested_outcome="CALLBACK",
+                        callback_requested=True,
+                        field_updates={"callback_time": "tomorrow"},
+                    ),
+                }
+            ),
+        )
+        session.start()
+        await session.receive("sell")
+
+        await session.receive("call me back tomorrow")
+
+        self.assertEqual(session.state.outcome, "SELL")
+        self.assertTrue(session.state.callback_requested)
 
 
 if __name__ == "__main__":

@@ -20,25 +20,26 @@ from speaking_agent.adapters.llm.qwen_mlx import (
     MlxLmBackend,
     QwenMlxConversationModel,
 )
+from speaking_agent.adapters.telephony.sounddevice_local import (
+    EchoSuppressionConfig,
+    SoundDeviceCallTransport,
+)
 from speaking_agent.adapters.tts.qwen_mlx import (
     DEFAULT_TTS_MODEL_PATH,
     QwenMlxSpeechSynthesizer,
 )
 from speaking_agent.campaign import load_campaign
 from speaking_agent.conversation import ConversationSession
+from speaking_agent.delivery import campaign_voice_style
 from speaking_agent.domain import AgentReply, SessionAction
+from speaking_agent.recording import latency_snapshot
 from speaking_agent.speech import AudioFrame, PcmFormat, SynthesisOptions
 from speaking_agent.turn_detection import (
     EnergyTurnDetector,
     TurnDetectionConfig,
     TurnEventKind,
 )
-
-
-DEFAULT_VOICE_STYLE = (
-    "Speak warmly and naturally with conversational pacing, subtle pauses, and no "
-    "announcer tone. Keep the delivery calm and concise."
-)
+from speaking_agent.voice_session import CallSession
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,11 +172,13 @@ async def _transcribe(
     frames: tuple[AudioFrame, ...],
     *,
     language: str,
+    context: str = "",
 ) -> str:
     final_text = ""
     async for event in recognizer.transcribe(
         _frames(frames),
         language=language,
+        context=context,
     ):
         if event.is_final:
             final_text = event.text.strip()
@@ -235,8 +238,73 @@ async def _speak(
     )
 
 
+async def _run_full_duplex(
+    args: argparse.Namespace,
+    audio: Any,
+    *,
+    campaign: Any,
+    model: QwenMlxConversationModel,
+    recognizer: QwenMlxSpeechRecognizer,
+    synthesizer: QwenMlxSpeechSynthesizer,
+    input_device: int | str | None,
+    output_device: int | str | None,
+    turn_config: TurnDetectionConfig,
+) -> int:
+    transport = SoundDeviceCallTransport(
+        audio=audio,
+        input_device=input_device,
+        output_device=output_device,
+        echo_config=EchoSuppressionConfig(
+            barge_in_energy_threshold=args.barge_in_energy_threshold,
+            echo_correlation_threshold=args.echo_correlation_threshold,
+            echo_gain=args.echo_gain,
+            echo_tail_ms=args.echo_tail_ms,
+        ),
+    )
+    ready = False
+
+    def show_reply(reply: AgentReply) -> None:
+        nonlocal ready
+        if not ready:
+            print(
+                "Ready. Full-duplex microphone and barge-in are active.",
+                flush=True,
+            )
+            ready = True
+        print(f"Agent: {reply.text}", flush=True)
+
+    session = CallSession(
+        campaign=campaign,
+        model=model,
+        recognizer=recognizer,
+        synthesizer=synthesizer,
+        transport=transport,
+        turn_detector=EnergyTurnDetector(turn_config),
+        on_transcript=lambda text: print(f"You: {text}", flush=True),
+        on_agent_reply=show_reply,
+        on_interruption=lambda: print(
+            "Barge-in detected; stopping agent playback...",
+            flush=True,
+        ),
+        recognition_language=args.language,
+        recognition_context=campaign.speech_recognition_context,
+        transfer_available=False,
+    )
+    print("Loading local Qwen LLM, ASR, and TTS models...", flush=True)
+    result = await session.run()
+    print(
+        "Session: "
+        f"interruptions={result.interruptions} "
+        f"latencies={json.dumps(latency_snapshot(session.trace), sort_keys=True)}"
+    )
+    print("Result:")
+    print(json.dumps(asdict(result.lead), indent=2))
+    return 0
+
+
 async def run(args: argparse.Namespace, audio: Any) -> int:
     campaign = load_campaign(args.campaign)
+    voice_style = args.style or campaign_voice_style(campaign)
     model = QwenMlxConversationModel(
         MlxLmBackend(args.model_path or DEFAULT_MODEL_PATH)
     )
@@ -247,6 +315,7 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
         model_path=args.tts_model_path or DEFAULT_TTS_MODEL_PATH,
         default_voice=args.voice,
         default_language=args.language,
+        default_style=voice_style,
     )
     session = ConversationSession(campaign, model)
     input_device = _device(args.input_device)
@@ -257,6 +326,19 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
         end_silence_ms=args.end_silence_ms,
         maximum_utterance_ms=args.maximum_utterance_ms,
     )
+
+    if args.full_duplex:
+        return await _run_full_duplex(
+            args,
+            audio,
+            campaign=campaign,
+            model=model,
+            recognizer=recognizer,
+            synthesizer=synthesizer,
+            input_device=input_device,
+            output_device=output_device,
+            turn_config=turn_config,
+        )
 
     _check_audio_settings(
         audio,
@@ -286,7 +368,7 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
             output_device=output_device,
             voice=args.voice,
             language=args.language,
-            style=args.style,
+            style=voice_style,
             response_started_at=time.perf_counter(),
         )
 
@@ -313,6 +395,7 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
                 recognizer,
                 frames,
                 language=args.language,
+                context=campaign.speech_recognition_context,
             )
             asr_seconds = time.perf_counter() - asr_started_at
             print(f"You: {transcript}")
@@ -337,7 +420,7 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
                 output_device=output_device,
                 voice=args.voice,
                 language=args.language,
-                style=args.style,
+                style=voice_style,
                 response_started_at=response_started_at,
             )
             metrics = TurnMetrics(
@@ -378,7 +461,10 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tts-model-path")
     parser.add_argument("--voice", default="Aiden")
     parser.add_argument("--language", default="English")
-    parser.add_argument("--style", default=DEFAULT_VOICE_STYLE)
+    parser.add_argument(
+        "--style",
+        help="Override the campaign voice style for this run",
+    )
     parser.add_argument("--input-device")
     parser.add_argument("--output-device")
     parser.add_argument("--listen-timeout-seconds", type=float, default=15.0)
@@ -389,18 +475,48 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         default=60,
         help="Minimum voiced duration; 60 ms preserves short words such as yes or no",
     )
-    parser.add_argument("--end-silence-ms", type=int, default=700)
+    parser.add_argument("--end-silence-ms", type=int, default=550)
     parser.add_argument("--maximum-utterance-ms", type=int, default=30_000)
-    parser.add_argument(
+    audio_modes = parser.add_mutually_exclusive_group()
+    audio_modes.add_argument(
         "--speaker-mode",
         action="store_true",
         help="Wait for room echo to settle before opening the microphone",
+    )
+    audio_modes.add_argument(
+        "--full-duplex",
+        action="store_true",
+        help="Listen during playback and stop the agent on confirmed near-end speech",
     )
     parser.add_argument(
         "--speaker-settle-ms",
         type=int,
         default=500,
         help="Room-echo guard before automatic microphone listening",
+    )
+    parser.add_argument(
+        "--barge-in-energy-threshold",
+        type=float,
+        default=0.03,
+        help="Near-end speech energy required while speaker audio is active",
+    )
+    parser.add_argument(
+        "--echo-correlation-threshold",
+        type=float,
+        default=0.45,
+        help="Correlation above which microphone audio is treated as speaker echo",
+    )
+    parser.add_argument(
+        "--echo-gain",
+        type=float,
+        default=1.0,
+        help="Expected maximum microphone echo relative to output amplitude",
+    )
+    parser.add_argument(
+        "--echo-tail-ms",
+        type=int,
+        default=250,
+        help="Continue suppressing probable echo after playback stops",
     )
     parser.add_argument("--list-devices", action="store_true")
     args = parser.parse_args(arguments)
@@ -410,6 +526,14 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--energy-threshold must be between 0 and 1")
     if args.speaker_settle_ms < 0:
         parser.error("--speaker-settle-ms cannot be negative")
+    if not 0 < args.barge_in_energy_threshold <= 1:
+        parser.error("--barge-in-energy-threshold must be between 0 and 1")
+    if not 0 <= args.echo_correlation_threshold <= 1:
+        parser.error("--echo-correlation-threshold must be between 0 and 1")
+    if args.echo_gain < 0:
+        parser.error("--echo-gain cannot be negative")
+    if args.echo_tail_ms < 0:
+        parser.error("--echo-tail-ms cannot be negative")
     for name in (
         "minimum_speech_ms",
         "end_silence_ms",
@@ -433,7 +557,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print("\nLocal voice chat stopped.")
         return 130
     except Exception as error:
-        print(f"Local voice chat error: {error}", file=sys.stderr)
+        detail = str(error).strip() or repr(error)
+        print(
+            f"Local voice chat error ({type(error).__name__}): {detail}",
+            file=sys.stderr,
+        )
         return 2
 
 

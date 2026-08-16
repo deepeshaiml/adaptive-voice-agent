@@ -11,6 +11,8 @@
     "automated assistant"
   ],
 
+  "speech_recognition_context": "Acme Property; Dubai property enquiry; Dubai Marina; Downtown Dubai; Business Bay; Jumeirah Village Circle; JVC; Palm Jumeirah; Dubai Hills Estate; apartment; flat; studio; penthouse; duplex; villa; townhouse; warehouse; selling; renting; listed; annual rent; AED.",
+
   "voice_style": {
     "personality": "Warm, calm, polite, observant, and easy to talk to.",
     "tone": "Professional but conversational. Sound like a normal property enquiry rather than a sales script.",
@@ -282,6 +284,18 @@
     ]
   },
 
+  "field_extraction_hints": {
+    "property_location": [
+      "Dubai Marina",
+      "Downtown Dubai",
+      "Business Bay",
+      "Jumeirah Village Circle",
+      "JVC",
+      "Palm Jumeirah",
+      "Dubai Hills Estate"
+    ]
+  },
+
   "fields_by_outcome": {
     "SELL": [
       "property_location",
@@ -548,6 +562,7 @@
     "concise_responses": true,
     "preferred_sentences_per_turn": "1-2",
     "preferred_spoken_words_per_turn": "6-25",
+    "conversation_memory_turns": 12,
     "max_unclear_retries": 2,
     "model_timeout_seconds": 30,
     "asr_timeout_seconds": 30,

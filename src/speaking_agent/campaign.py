@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any
+
+from speaking_agent.text_safety import claims_human_identity, normalize_text
 
 
 @dataclass(frozen=True)
@@ -21,14 +24,24 @@ class Campaign:
     outcome_guidance: dict[str, str]
     field_types: dict[str, str]
     field_allowed_values: dict[str, tuple[str, ...]]
+    field_extraction_hints: dict[str, tuple[str, ...]]
     questions: dict[str, str]
     terminal_outcomes: tuple[str, ...]
     closing_messages: dict[str, str]
     transfer_unavailable_message: str
     question_variants: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    opening_variants: tuple[str, ...] = ()
     conversation_brief: str = ""
     conversation_guidelines: tuple[str, ...] = ()
     scenario_playbook: tuple[dict[str, str], ...] = ()
+    voice_style: dict[str, Any] = field(default_factory=dict)
+    natural_conversation_rules: tuple[str, ...] = ()
+    conversation_flow: tuple[dict[str, Any], ...] = ()
+    field_collection_rules: tuple[str, ...] = ()
+    sample_phrases: dict[str, Any] = field(default_factory=dict)
+    interruption_and_silence_handling: dict[str, Any] = field(default_factory=dict)
+    hard_stop_context_rules: tuple[str, ...] = ()
+    speech_recognition_context: str = ""
     voicemail_message: str | None = None
     outcome_field: str | None = None
     classification_rules: tuple[str, ...] = ()
@@ -92,6 +105,8 @@ class Campaign:
             for name in required_fields
         ):
             raise ValueError("Campaign required_fields must contain non-empty strings")
+        if not isinstance(data["required_disclosures"], (list, tuple)):
+            raise ValueError("Campaign required_disclosures must be an array")
         required_disclosures = tuple(data["required_disclosures"])
         if not required_disclosures or any(
             not isinstance(disclosure, str) or not disclosure.strip()
@@ -242,6 +257,30 @@ class Campaign:
             name: tuple(value.casefold().strip() for value in values)
             for name, values in raw_field_allowed_values.items()
         }
+        raw_field_extraction_hints = data.get("field_extraction_hints", {})
+        if not isinstance(raw_field_extraction_hints, dict):
+            raise ValueError("Campaign field_extraction_hints must be an object")
+        unknown_hint_fields = raw_field_extraction_hints.keys() - configured_fields
+        invalid_hint_fields = [
+            name
+            for name, values in raw_field_extraction_hints.items()
+            if field_types.get(name) != "string"
+            or not isinstance(values, (list, tuple))
+            or not values
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ]
+        invalid_hint_fields = sorted(
+            set(unknown_hint_fields) | set(invalid_hint_fields)
+        )
+        if invalid_hint_fields:
+            raise ValueError(
+                "Campaign field extraction hints are invalid for fields: "
+                + ", ".join(invalid_hint_fields)
+            )
+        field_extraction_hints = {
+            name: tuple(value.strip() for value in values)
+            for name, values in raw_field_extraction_hints.items()
+        }
 
         missing_questions = configured_fields - data["questions"].keys()
         if missing_questions:
@@ -293,6 +332,23 @@ class Campaign:
             name: tuple(variants)
             for name, variants in raw_question_variants.items()
         }
+        opening_variants = tuple(data.get("opening_variants", ()))
+        invalid_opening_variants = [
+            index
+            for index, opening in enumerate(opening_variants)
+            if not isinstance(opening, str)
+            or not opening.strip()
+            or any(
+                disclosure.casefold() not in opening.casefold()
+                for disclosure in required_disclosures
+            )
+        ]
+        if invalid_opening_variants:
+            raise ValueError(
+                "Campaign opening_variants must be non-empty and include required "
+                "disclosures at indices: "
+                + ", ".join(str(index) for index in invalid_opening_variants)
+            )
 
         behavior = dict(data.get("behavior", {}))
         for key in (
@@ -305,6 +361,12 @@ class Campaign:
         for key in ("max_unclear_retries", "max_model_failures"):
             if not isinstance(behavior.get(key), int) or behavior[key] < 1:
                 raise ValueError(f"Campaign behavior.{key} must be a positive integer")
+        memory_turns = behavior.get("conversation_memory_turns", 12)
+        if not isinstance(memory_turns, int) or isinstance(memory_turns, bool) or memory_turns < 1:
+            raise ValueError(
+                "Campaign behavior.conversation_memory_turns must be a positive integer"
+            )
+        behavior["conversation_memory_turns"] = memory_turns
         if (
             not isinstance(behavior.get("model_error_message"), str)
             or not behavior["model_error_message"].strip()
@@ -439,6 +501,63 @@ class Campaign:
             {"when": scenario["when"], "strategy": scenario["strategy"]}
             for scenario in raw_scenario_playbook
         )
+        voice_style = dict(data.get("voice_style", {}))
+        if _has_invalid_text_tree(voice_style):
+            raise ValueError("Campaign voice_style contains invalid text")
+        natural_conversation_rules = _text_tuple(
+            data,
+            "natural_conversation_rules",
+        )
+        field_collection_rules = _text_tuple(data, "field_collection_rules")
+        hard_stop_context_rules = _text_tuple(data, "hard_stop_context_rules")
+        raw_conversation_flow = data.get("conversation_flow", ())
+        if not isinstance(raw_conversation_flow, (list, tuple)):
+            raise ValueError("Campaign conversation_flow must be an array")
+        invalid_flow_stages = [
+            index
+            for index, stage in enumerate(raw_conversation_flow)
+            if not isinstance(stage, dict)
+            or set(stage) != {"stage", "goal", "instructions", "exit_when"}
+            or not isinstance(stage["stage"], str)
+            or not stage["stage"].strip()
+            or not isinstance(stage["goal"], str)
+            or not stage["goal"].strip()
+            or not isinstance(stage["exit_when"], str)
+            or not stage["exit_when"].strip()
+            or not isinstance(stage["instructions"], (list, tuple))
+            or not stage["instructions"]
+            or any(
+                not isinstance(instruction, str) or not instruction.strip()
+                for instruction in stage["instructions"]
+            )
+        ]
+        if invalid_flow_stages:
+            raise ValueError(
+                "Campaign conversation_flow has invalid stages at indices: "
+                + ", ".join(str(index) for index in invalid_flow_stages)
+            )
+        conversation_flow = tuple(
+            {
+                "stage": stage["stage"],
+                "goal": stage["goal"],
+                "instructions": tuple(stage["instructions"]),
+                "exit_when": stage["exit_when"],
+            }
+            for stage in raw_conversation_flow
+        )
+        sample_phrases = dict(data.get("sample_phrases", {}))
+        if _has_invalid_text_tree(sample_phrases):
+            raise ValueError("Campaign sample_phrases contains invalid text")
+        interruption_and_silence_handling = dict(
+            data.get("interruption_and_silence_handling", {})
+        )
+        if _has_invalid_text_tree(interruption_and_silence_handling):
+            raise ValueError(
+                "Campaign interruption_and_silence_handling contains invalid text"
+            )
+        speech_recognition_context = data.get("speech_recognition_context", "")
+        if not isinstance(speech_recognition_context, str):
+            raise ValueError("Campaign speech_recognition_context must be a string")
         voicemail_message = data.get("voicemail_message")
         if voicemail_message is not None and (
             not isinstance(voicemail_message, str) or not voicemail_message.strip()
@@ -457,6 +576,43 @@ class Campaign:
                     + ", ".join(missing_voicemail_disclosures)
                 )
 
+        spoken_messages = [
+            ("introduction", data["introduction"]),
+            ("opening", data["opening"]),
+            ("transfer_unavailable_message", data["transfer_unavailable_message"]),
+            ("behavior.model_error_message", behavior["model_error_message"]),
+            *(
+                (f"opening_variants[{index}]", message)
+                for index, message in enumerate(opening_variants)
+            ),
+            *((f"questions.{name}", message) for name, message in data["questions"].items()),
+            *(
+                (f"question_variants.{name}[{index}]", message)
+                for name, variants in question_variants.items()
+                for index, message in enumerate(variants)
+            ),
+            *(
+                (f"closing_messages.{outcome}", message)
+                for outcome, message in closing_messages.items()
+            ),
+            *(
+                (f"faq_answers.{question}", answer)
+                for question, answer in faq_answers.items()
+            ),
+        ]
+        if voicemail_message is not None:
+            spoken_messages.append(("voicemail_message", voicemail_message))
+        unsafe_messages = [
+            name
+            for name, message in spoken_messages
+            if _contains_prohibited_claim(message, prohibited_statements)
+        ]
+        if unsafe_messages:
+            raise ValueError(
+                "Campaign spoken text contains prohibited statements: "
+                + ", ".join(sorted(unsafe_messages))
+            )
+
         return cls(
             campaign_id=data["campaign_id"],
             name=data["name"],
@@ -471,14 +627,24 @@ class Campaign:
             outcome_guidance=outcome_guidance,
             field_types=field_types,
             field_allowed_values=field_allowed_values,
+            field_extraction_hints=field_extraction_hints,
             questions=dict(data["questions"]),
             terminal_outcomes=terminal_outcomes,
             closing_messages=closing_messages,
             transfer_unavailable_message=data["transfer_unavailable_message"],
             question_variants=question_variants,
+            opening_variants=opening_variants,
             conversation_brief=conversation_brief,
             conversation_guidelines=conversation_guidelines,
             scenario_playbook=scenario_playbook,
+            voice_style=voice_style,
+            natural_conversation_rules=natural_conversation_rules,
+            conversation_flow=conversation_flow,
+            field_collection_rules=field_collection_rules,
+            sample_phrases=sample_phrases,
+            interruption_and_silence_handling=interruption_and_silence_handling,
+            hard_stop_context_rules=hard_stop_context_rules,
+            speech_recognition_context=speech_recognition_context.strip(),
             voicemail_message=voicemail_message,
             outcome_field=outcome_field,
             classification_rules=classification_rules,
@@ -497,3 +663,40 @@ def load_campaign(path: str | Path) -> Campaign:
     if not isinstance(data, dict):
         raise ValueError("Campaign root must be a JSON object")
     return Campaign.from_dict(data)
+
+
+def _text_tuple(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    values = data.get(key, ())
+    if not isinstance(values, (list, tuple)) or any(
+        not isinstance(value, str) or not value.strip() for value in values
+    ):
+        raise ValueError(f"Campaign {key} must contain non-empty strings")
+    return tuple(values)
+
+
+def _has_invalid_text_tree(value: Any) -> bool:
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, dict):
+        return any(
+            not isinstance(key, str)
+            or not key.strip()
+            or _has_invalid_text_tree(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_has_invalid_text_tree(child) for child in value)
+    return value is not None and not isinstance(value, (bool, int, float))
+
+
+def _contains_prohibited_claim(
+    text: str,
+    prohibited_statements: tuple[str, ...],
+) -> bool:
+    normalized = normalize_text(text)
+    if any(
+        " ".join(statement.casefold().split()) in normalized
+        for statement in prohibited_statements
+    ):
+        return True
+    return claims_human_identity(normalized)

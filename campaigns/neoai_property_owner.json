@@ -45,6 +45,7 @@
     "Acme Property",
     "AI assistant"
   ],
+  "speech_recognition_context": "NeoAI; Acme Property; Dubai property enquiry; Dubai Marina; Downtown Dubai; Business Bay; Jumeirah Village Circle; Palm Jumeirah; Dubai Hills Estate; apartment; flat; villa; townhouse; selling; renting; AED.",
   "desired_outcomes": [
     "SELL",
     "RENT",
@@ -88,6 +89,17 @@
     "expected_rent": "string",
     "follow_up_date": "string",
     "callback_time": "string"
+  },
+  "field_extraction_hints": {
+    "property_location": [
+      "Dubai Marina",
+      "Downtown Dubai",
+      "Business Bay",
+      "Jumeirah Village Circle",
+      "JVC",
+      "Palm Jumeirah",
+      "Dubai Hills Estate"
+    ]
   },
   "fields_by_outcome": {
     "SELL": [
@@ -181,6 +193,7 @@
     "ask_one_question_at_a_time": true,
     "avoid_repeating_known_information": true,
     "concise_responses": true,
+    "conversation_memory_turns": 12,
     "max_unclear_retries": 2,
     "model_timeout_seconds": 30,
     "asr_timeout_seconds": 30,

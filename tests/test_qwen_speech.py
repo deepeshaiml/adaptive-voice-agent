@@ -92,7 +92,20 @@ class QwenSpeechAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frames[0].format.sample_rate_hz, 24_000)
         self.assertEqual(frames[0].sample_count, 4)
         self.assertEqual(model.kwargs["voice"], "Ryan")
+        self.assertEqual(model.kwargs["instruct"], "Warm and concise")
         self.assertTrue(model.kwargs["stream"])
+
+    async def test_tts_uses_default_style_without_per_call_options(self) -> None:
+        model = FakeTtsModel()
+        synthesizer = QwenMlxSpeechSynthesizer(
+            model=model,
+            default_style="Natural telephone delivery",
+        )
+
+        frames = [frame async for frame in synthesizer.synthesize("Hello")]
+
+        self.assertTrue(frames)
+        self.assertEqual(model.kwargs["instruct"], "Natural telephone delivery")
 
 
 if __name__ == "__main__":

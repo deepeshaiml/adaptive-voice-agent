@@ -4,16 +4,17 @@ import time
 import unittest
 
 from speaking_agent.domain import AgentReply
+from speaking_agent.delivery import campaign_voice_style
 from speaking_agent.local_voice_chat import (
     _check_audio_settings,
     _device,
     _record_utterance,
     _speak,
     _wait_for_room_echo,
-    DEFAULT_VOICE_STYLE,
     parse_args,
 )
 from speaking_agent.speech import AudioFrame, PcmFormat
+from speaking_agent.speech import TranscriptEvent
 from speaking_agent.turn_detection import TurnDetectionConfig
 
 
@@ -87,7 +88,35 @@ class FakeSynthesizer:
         yield frame
 
 
+class ContextRecognizer:
+    def __init__(self) -> None:
+        self.context = None
+
+    async def transcribe(self, audio, *, language=None, context=""):
+        del language
+        async for _ in audio:
+            pass
+        self.context = context
+        yield TranscriptEvent(text="Dubai Marina", is_final=True)
+
+
 class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_half_duplex_transcription_receives_campaign_context(self) -> None:
+        from speaking_agent.local_voice_chat import _transcribe
+
+        recognizer = ContextRecognizer()
+        frame = AudioFrame(data=bytes(640), format=PcmFormat(16_000))
+
+        text = await _transcribe(
+            recognizer,
+            (frame,),
+            language="English",
+            context="Acme Property; Dubai Marina",
+        )
+
+        self.assertEqual(text, "Dubai Marina")
+        self.assertEqual(recognizer.context, "Acme Property; Dubai Marina")
+
     def test_device_accepts_an_index_or_name(self) -> None:
         self.assertEqual(_device("2"), 2)
         self.assertEqual(_device("MacBook Pro Microphone"), "MacBook Pro Microphone")
@@ -102,7 +131,41 @@ class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
         args = parse_args(["--speaker-mode", "--speaker-settle-ms", "750"])
         self.assertTrue(args.speaker_mode)
         self.assertEqual(args.speaker_settle_ms, 750)
-        self.assertEqual(args.style, DEFAULT_VOICE_STYLE)
+        self.assertIsNone(args.style)
+
+    def test_campaign_voice_style_drives_default_delivery(self) -> None:
+        from speaking_agent.campaign import load_campaign
+
+        campaign = load_campaign("campaigns/property_owner.json")
+        style = campaign_voice_style(campaign)
+
+        self.assertIn("Professional but conversational", style)
+        self.assertIn("Avoid sounding like a survey", style)
+
+    def test_full_duplex_mode_exposes_echo_and_barge_in_tuning(self) -> None:
+        args = parse_args(
+            [
+                "--full-duplex",
+                "--barge-in-energy-threshold",
+                "0.06",
+                "--echo-correlation-threshold",
+                "0.55",
+                "--echo-gain",
+                "0.4",
+                "--echo-tail-ms",
+                "300",
+            ]
+        )
+
+        self.assertTrue(args.full_duplex)
+        self.assertEqual(args.barge_in_energy_threshold, 0.06)
+        self.assertEqual(args.echo_correlation_threshold, 0.55)
+        self.assertEqual(args.echo_gain, 0.4)
+        self.assertEqual(args.echo_tail_ms, 300)
+
+        defaults = parse_args(["--full-duplex"])
+        self.assertEqual(defaults.barge_in_energy_threshold, 0.03)
+        self.assertEqual(defaults.echo_gain, 1.0)
 
     def test_audio_settings_use_defaults_when_devices_are_omitted(self) -> None:
         audio = FakeAudio()

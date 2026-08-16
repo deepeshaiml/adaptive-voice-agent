@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 from uuid import uuid4
 
 from speaking_agent.campaign import Campaign
@@ -25,6 +26,7 @@ class ConversationSession:
         *,
         call_id: str | None = None,
         session_id: str | None = None,
+        delivery_tracking: bool = False,
     ) -> None:
         self.campaign = campaign
         self.model = model
@@ -34,33 +36,52 @@ class ConversationSession:
             session_id=session_id or str(uuid4()),
             campaign_id=campaign.campaign_id,
         )
+        opening_choices = (campaign.opening, *campaign.opening_variants)
+        opening_index = int.from_bytes(
+            hashlib.sha256(self.state.session_id.encode("utf-8")).digest()[:4],
+            "big",
+        ) % len(opening_choices)
+        self.opening = opening_choices[opening_index]
+        self._delivery_tracking = delivery_tracking
         self._started = False
 
-    def start(self) -> AgentReply:
+    def start(self, *, remember_reply: bool = True) -> AgentReply:
         if self._started:
             raise RuntimeError("Conversation session has already started")
         self._started = True
         self.state.stage = ConversationStage.DISCOVERY
-        self._record_question(self.campaign.opening_field)
-        return AgentReply(self.campaign.opening)
+        reply = AgentReply(
+            self.opening,
+            question_field=self.campaign.opening_field,
+        )
+        if remember_reply:
+            self._remember_agent_reply(reply)
+        return reply
 
     async def receive(self, utterance: str) -> AgentReply:
         if not self._started:
             raise RuntimeError("Conversation session has not started")
 
         hard_stop_outcome = self.policy.hard_stop_outcome(utterance)
+        if self.state.ended and hard_stop_outcome is None:
+            raise RuntimeError("Conversation session has ended")
+        model_state = deepcopy(self.state)
+        self._remember_owner_utterance(utterance)
         if hard_stop_outcome is not None:
             self.policy.apply_outcome(self.state, hard_stop_outcome)
             return self._finish(hard_stop_outcome)
-        if self.state.ended:
-            raise RuntimeError("Conversation session has ended")
+        direct_faq_answer = self.policy.direct_faq_answer(utterance)
+        if direct_faq_answer is not None:
+            safe_faq_answer = self.policy.safe_response_prefix(direct_faq_answer)
+            if safe_faq_answer is not None:
+                return self._ask_next(safe_faq_answer)
 
         timeout_seconds = float(self.campaign.behavior.get("model_timeout_seconds", 30))
         try:
             async with asyncio.timeout(timeout_seconds):
                 interpretation = await self.model.interpret(
                     utterance,
-                    deepcopy(self.state),
+                    model_state,
                     self.campaign,
                 )
         except (TimeoutError, ConversationModelError):
@@ -81,17 +102,31 @@ class ConversationSession:
             interpretation.suggested_outcome,
             utterance,
         )
+        deterministic_updates = self.policy.deterministic_field_updates(
+            self.state,
+            utterance,
+        )
         interpretation = replace(
             interpretation,
             suggested_outcome=validated_outcome,
+            field_updates={
+                **interpretation.field_updates,
+                **deterministic_updates,
+            },
         )
-        changed = self.policy.apply_interpretation(self.state, interpretation)
+        changed = self.policy.apply_interpretation(
+            self.state,
+            interpretation,
+            utterance,
+            trusted_field_names=set(deterministic_updates),
+        )
         if interpretation.suggested_outcome in self.campaign.desired_outcomes:
             self.policy.apply_outcome(self.state, interpretation.suggested_outcome)
 
         answer = self.policy.safe_response_prefix(interpretation.answer)
-        acknowledgement = self.policy.safe_response_prefix(
-            interpretation.acknowledgement
+        acknowledgement = self.policy.safe_acknowledgement(
+            interpretation.acknowledgement,
+            self.state.recent_dialogue,
         )
         response_prefix = answer or acknowledgement
         if changed:
@@ -120,7 +155,11 @@ class ConversationSession:
         if next_field is None and self.state.outcome != "UNKNOWN":
             return self._finish(self.state.outcome)
 
-        return self._ask_next(response_prefix)
+        return self._ask_next(
+            response_prefix,
+            suggested_field=interpretation.next_question_field,
+            suggested_question=interpretation.next_question,
+        )
 
     def result(self) -> LeadOutcome:
         if not self.state.ended:
@@ -156,7 +195,90 @@ class ConversationSession:
         )
         self.state.last_asked_field = field_name
 
-    def _ask_next(self, prefix: str | None = None) -> AgentReply:
+    def _remember_owner_utterance(self, utterance: str) -> None:
+        normalized = " ".join(utterance.split())
+        if not normalized:
+            return
+        self.state.recent_owner_utterances.append(normalized)
+        memory_turns = int(
+            self.campaign.behavior.get("conversation_memory_turns", 12)
+        )
+        del self.state.recent_owner_utterances[:-memory_turns]
+        self._remember_dialogue("owner", normalized)
+
+    def _remember_agent_reply(self, reply: AgentReply) -> AgentReply:
+        delivery = "pending" if self._delivery_tracking else "delivered"
+        self._remember_dialogue(
+            "agent",
+            reply.text,
+            delivery=delivery,
+            question_field=reply.question_field,
+        )
+        if not self._delivery_tracking and reply.question_field is not None:
+            self._record_question(reply.question_field)
+        return reply
+
+    def mark_agent_reply_started(self, reply: AgentReply) -> None:
+        normalized_spoken_text = " ".join(reply.text.split())
+        for turn in reversed(self.state.recent_dialogue):
+            if turn.get("role") != "agent":
+                continue
+            remembered_text = turn["text"]
+            if not (
+                normalized_spoken_text == remembered_text
+                or normalized_spoken_text.endswith(remembered_text)
+            ):
+                continue
+            if reply.question_field is not None and not turn.get("question_started"):
+                self._record_question(reply.question_field)
+                turn["question_started"] = True
+            return
+
+    def mark_agent_reply_delivery(self, spoken_text: str, delivery: str) -> None:
+        if delivery not in {"pending", "interrupted", "delivered"}:
+            raise ValueError("Unsupported agent reply delivery state")
+        normalized_spoken_text = " ".join(spoken_text.split())
+        for turn in reversed(self.state.recent_dialogue):
+            if turn.get("role") != "agent":
+                continue
+            remembered_text = turn["text"]
+            if (
+                normalized_spoken_text == remembered_text
+                or normalized_spoken_text.endswith(remembered_text)
+            ):
+                turn["delivery"] = delivery
+                return
+
+    def _remember_dialogue(
+        self,
+        role: str,
+        text: str,
+        *,
+        delivery: str | None = None,
+        question_field: str | None = None,
+    ) -> None:
+        normalized = " ".join(text.split())
+        if not normalized:
+            return
+        turn = {"role": role, "text": normalized}
+        if delivery is not None:
+            turn["delivery"] = delivery
+        if question_field is not None:
+            turn["question_field"] = question_field
+        self.state.recent_dialogue.append(turn)
+        memory_turns = int(
+            self.campaign.behavior.get("conversation_memory_turns", 12)
+        )
+        maximum_entries = memory_turns * 2 + 1
+        del self.state.recent_dialogue[:-maximum_entries]
+
+    def _ask_next(
+        self,
+        prefix: str | None = None,
+        *,
+        suggested_field: str | None = None,
+        suggested_question: str | None = None,
+    ) -> AgentReply:
         next_field = self.policy.next_missing_field(self.state)
         if next_field is None:
             next_field = self.campaign.opening_field
@@ -165,11 +287,33 @@ class ConversationSession:
             if next_field == self.campaign.opening_field
             else ConversationStage.QUALIFICATION
         )
-        question = self._question_for(next_field)
-        self._record_question(next_field)
-        return AgentReply(f"{prefix.strip()} {question}" if prefix else question)
+        question = self._question_for(
+            next_field,
+            suggested_field=suggested_field,
+            suggested_question=suggested_question,
+        )
+        return self._remember_agent_reply(
+            AgentReply(
+                f"{prefix.strip()} {question}" if prefix else question,
+                question_field=next_field,
+            )
+        )
 
-    def _question_for(self, field_name: str) -> str:
+    def _question_for(
+        self,
+        field_name: str,
+        *,
+        suggested_field: str | None = None,
+        suggested_question: str | None = None,
+    ) -> str:
+        dynamic_question = self.policy.safe_dynamic_question(
+            field_name,
+            suggested_field,
+            suggested_question,
+            self.state.recent_dialogue,
+        )
+        if dynamic_question is not None:
+            return dynamic_question
         previous_asks = self.state.asked_field_counts.get(field_name, 0)
         variants = self.campaign.question_variants.get(field_name, ())
         if previous_asks == 0 or not variants:
@@ -190,4 +334,4 @@ class ConversationSession:
             effective_outcome,
             "Thank you for your time. Goodbye.",
         )
-        return AgentReply(message, action)
+        return self._remember_agent_reply(AgentReply(message, action))

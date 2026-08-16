@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+import inspect
 from typing import Any
 
 from speaking_agent.answering import AnswerKind, AnsweringMachineDetector
@@ -12,7 +13,12 @@ from speaking_agent.conversation import ConversationSession
 from speaking_agent.domain import AgentReply, LeadOutcome, SessionAction
 from speaking_agent.model import ConversationModel
 from speaking_agent.observability import LatencyTrace, TimingEventName
-from speaking_agent.speech import AudioFrame, SpeechRecognizer, SpeechSynthesizer
+from speaking_agent.speech import (
+    AudioFrame,
+    SpeechNotRecognizedError,
+    SpeechRecognizer,
+    SpeechSynthesizer,
+)
 from speaking_agent.transport import (
     CallTransport,
     TransportError,
@@ -38,6 +44,7 @@ class VoiceCallResult:
 class _TurnFinished:
     reply: AgentReply | None = None
     error: BaseException | None = None
+    ignored: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +77,18 @@ class CallSession:
         turn_detector: EnergyTurnDetector | None = None,
         trace: LatencyTrace | None = None,
         on_do_not_contact: Callable[[str], Awaitable[None]] | None = None,
+        on_transcript: Callable[[str], Awaitable[None] | None] | None = None,
+        on_agent_reply: Callable[[AgentReply], Awaitable[None] | None] | None = None,
+        on_interruption: Callable[[], Awaitable[None] | None] | None = None,
+        recognition_language: str | None = None,
+        recognition_context: str = "",
         transfer_available: bool = True,
     ) -> None:
-        self.conversation = ConversationSession(campaign, model)
+        self.conversation = ConversationSession(
+            campaign,
+            model,
+            delivery_tracking=True,
+        )
         self.model = model
         self.recognizer = recognizer
         self.synthesizer = synthesizer
@@ -81,6 +97,11 @@ class CallSession:
         self.turn_detector = turn_detector or EnergyTurnDetector()
         self.trace = trace or LatencyTrace()
         self._on_do_not_contact = on_do_not_contact
+        self._on_transcript = on_transcript
+        self._on_agent_reply = on_agent_reply
+        self._on_interruption = on_interruption
+        self._recognition_language = recognition_language
+        self._recognition_context = recognition_context
         self._do_not_contact_persisted = False
         self._disclosure_delivered = False
         self._transfer_available = transfer_available
@@ -173,7 +194,11 @@ class CallSession:
                             for turn_event in self.turn_detector.process(event.audio):
                                 if turn_event.kind == TurnEventKind.SPEECH_STARTED:
                                     listening_deadline = None
-                                    await self._interrupt_playback()
+                                    if await self._interrupt_playback():
+                                        await self._notify(
+                                            self._on_interruption,
+                                            None,
+                                        )
                                 else:
                                     listening_deadline = None
                                     self.trace.record(TimingEventName.SPEECH_END)
@@ -196,9 +221,26 @@ class CallSession:
                                 await self._cancel_transfer_task()
                             if self._pending_turns:
                                 self._deferred_reply = event.reply
+                                self.conversation.mark_agent_reply_delivery(
+                                    event.reply.text,
+                                    "pending",
+                                )
                                 await self._start_turn(self._pending_turns.popleft())
                             else:
                                 await self._start_playback(event.reply)
+                        elif event.ignored:
+                            if self._pending_turns:
+                                await self._start_turn(self._pending_turns.popleft())
+                            elif self._deferred_reply is not None:
+                                deferred_reply = self._deferred_reply
+                                self._deferred_reply = None
+                                await self._start_playback(deferred_reply)
+                            else:
+                                listening_deadline = event_loop.time() + float(
+                                    self.conversation.campaign.behavior[
+                                        "conversation_idle_timeout_seconds"
+                                    ]
+                                )
                     elif isinstance(event, _SilentAction):
                         self._turn_task = None
                         self._active_turn_frames = None
@@ -227,6 +269,7 @@ class CallSession:
                             await self._process_disconnected_speech()
                             finished = True
                     else:
+                        active_reply = self._active_reply
                         self._playback_task = None
                         self._active_reply = None
                         if event.error is not None:
@@ -240,6 +283,11 @@ class CallSession:
                                 )
                             finished = True
                         else:
+                            if active_reply is not None:
+                                self.conversation.mark_agent_reply_delivery(
+                                    active_reply.text,
+                                    "delivered",
+                                )
                             if event.disclosure_delivered:
                                 self._disclosure_delivered = True
                             if event.action == SessionAction.HANG_UP:
@@ -329,6 +377,7 @@ class CallSession:
     async def _process_turn_and_notify(self, frames: tuple[AudioFrame, ...]) -> None:
         try:
             final_text = await self._transcribe_turn(frames)
+            await self._notify(self._on_transcript, final_text)
             hard_stop = self.conversation.policy.hard_stop_outcome(final_text)
             if self.conversation.state.ended and hard_stop is None:
                 deferred_reply = self._deferred_reply
@@ -367,7 +416,7 @@ class CallSession:
                             )
                         )
                     return
-                self.conversation.start()
+                self.conversation.start(remember_reply=False)
             self.trace.record(TimingEventName.LLM_START)
             reply = await self.conversation.receive(final_text)
             self._deferred_reply = None
@@ -376,6 +425,8 @@ class CallSession:
             await self._queue.put(_TurnFinished(reply=reply))
         except asyncio.CancelledError:
             raise
+        except SpeechNotRecognizedError:
+            await self._queue.put(_TurnFinished(ignored=True))
         except BaseException as error:
             await self._queue.put(_TurnFinished(error=error))
 
@@ -386,7 +437,9 @@ class CallSession:
             float(self.conversation.campaign.behavior["asr_timeout_seconds"])
         ):
             async for event in self.recognizer.transcribe(
-                self._audio_frames(frames)
+                self._audio_frames(frames),
+                language=self._recognition_language,
+                context=self._recognition_context,
             ):
                 if event.is_final:
                     final_text = event.text
@@ -395,7 +448,9 @@ class CallSession:
                     self.trace.record(TimingEventName.ASR_PARTIAL)
                     saw_partial = True
         if not final_text.strip():
-            raise RuntimeError("Speech recognizer returned no final transcript")
+            raise SpeechNotRecognizedError(
+                "Speech recognizer returned no final transcript"
+            )
         return final_text
 
     async def _process_disconnected_speech(self) -> None:
@@ -414,13 +469,17 @@ class CallSession:
         await self._cancel_turn_task()
         self._pending_turns.clear()
         for frames in turns:
-            final_text = await self._transcribe_turn(frames)
+            try:
+                final_text = await self._transcribe_turn(frames)
+            except SpeechNotRecognizedError:
+                continue
+            await self._notify(self._on_transcript, final_text)
             hard_stop = self.conversation.policy.hard_stop_outcome(final_text)
             if hard_stop is None:
                 continue
             if self._answer_kind is None:
                 self._answer_kind = AnswerKind.HUMAN
-                self.conversation.start()
+                self.conversation.start(remember_reply=False)
             await self.conversation.receive(final_text)
             await self._persist_do_not_contact_if_needed()
             if hard_stop == "DO_NOT_CONTACT":
@@ -434,6 +493,8 @@ class CallSession:
                 SessionAction.HANG_UP,
             )
         reply, delivers_disclosure = self._with_required_disclosure(reply)
+        self.conversation.mark_agent_reply_delivery(reply.text, "pending")
+        await self._notify(self._on_agent_reply, reply)
         if self._task_group is None:
             raise RuntimeError("Call session task group is not active")
         self._active_reply = reply
@@ -463,6 +524,7 @@ class CallSession:
                         self.trace.record(TimingEventName.TTS_FIRST_AUDIO)
                     await self.transport.send_audio(frame)
                     if first_frame:
+                        self.conversation.mark_agent_reply_started(reply)
                         self.trace.record(TimingEventName.PLAYBACK_START)
                         first_frame = False
                 if first_frame:
@@ -496,6 +558,7 @@ class CallSession:
             reply = AgentReply(
                 f"{self.conversation.campaign.introduction} {reply.text}",
                 reply.action,
+                reply.question_field,
             )
         return reply, True
 
@@ -518,15 +581,20 @@ class CallSession:
         else:
             await self._queue.put(_TransferFinished())
 
-    async def _interrupt_playback(self, *, count: bool = True) -> None:
+    async def _interrupt_playback(self, *, count: bool = True) -> bool:
         task = self._playback_task
         if task is None or task.done():
-            return
+            return False
         if count:
             self.interruptions += 1
             self.trace.record(TimingEventName.INTERRUPTION)
             if self.conversation.state.ended and self._active_reply is not None:
                 self._deferred_reply = self._active_reply
+        if self._active_reply is not None:
+            self.conversation.mark_agent_reply_delivery(
+                self._active_reply.text,
+                "interrupted",
+            )
         await self.synthesizer.cancel()
         task.cancel()
         try:
@@ -536,6 +604,7 @@ class CallSession:
         self._playback_task = None
         self._active_reply = None
         await self.transport.stop_audio()
+        return True
 
     async def _cancel_active_tasks(self) -> None:
         await self._interrupt_playback(count=False)
@@ -577,3 +646,11 @@ class CallSession:
     async def _audio_frames(frames: tuple[AudioFrame, ...]) -> AsyncIterator[AudioFrame]:
         for frame in frames:
             yield frame
+
+    @staticmethod
+    async def _notify(callback: Callable[..., Any] | None, value: Any) -> None:
+        if callback is None:
+            return
+        result = callback() if value is None else callback(value)
+        if inspect.isawaitable(result):
+            await result

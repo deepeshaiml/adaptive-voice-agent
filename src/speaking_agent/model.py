@@ -17,6 +17,8 @@ class ModelInterpretation:
     field_updates: Mapping[str, Any] = field(default_factory=dict)
     answer: str | None = None
     acknowledgement: str | None = None
+    next_question_field: str | None = None
+    next_question: str | None = None
     callback_requested: bool | None = None
     human_transfer_requested: bool = False
 

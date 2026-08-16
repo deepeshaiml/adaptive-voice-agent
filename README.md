@@ -8,9 +8,39 @@ structured SQLite outcomes, operator tooling, and compliance-focused safeguards.
 The distribution and repository use the general name `adaptive-voice-agent`. The
 internal Python namespace remains `speaking_agent` for compatibility.
 
+The complete local inference stack is currently verified on Apple-silicon macOS. See
+[ROADMAP.md](ROADMAP.md) for the ordered cross-platform, CUDA, CPU, audio, packaging,
+benchmarking, and deployment TODOs.
+
 A real PSTN call has not been placed from this repository because that requires private
 LiveKit credentials, an outbound trunk, and a number explicitly controlled by the
 operator. The command is implemented but deliberately blocked without all three.
+
+## Current Status
+
+Status last verified on **2026-08-16** on Apple-silicon macOS with Python 3.12:
+
+| Area | Status |
+|---|---|
+| Campaign-driven conversation core | Complete and covered by scenario tests |
+| Deterministic safety and field grounding | Complete for configured policies |
+| Local Qwen LLM, ASR, and TTS | Verified with the pinned MLX models |
+| Local microphone/speaker conversation | Verified in half-duplex and speaker modes |
+| Local full duplex and barge-in | Implemented and tested; echo suppression remains experimental |
+| LiveKit room audio | Verified bidirectionally |
+| Outbound SIP/PSTN | Implemented behind controlled-call gates; real PSTN not yet exercised |
+| SQLite outcomes, suppression, retention, and metrics | Complete and tested |
+| Linux, Windows, CUDA, and portable inference | Not yet integrated or natively verified |
+
+The current validation passes **161 tests**, `pip check`, bytecode compilation, diff
+validation, local Markdown-link checks, and editor diagnostics. A real local Qwen
+planning smoke completed in 1.214 seconds for one warm single-turn scenario; this is a
+smoke measurement, not a P50/P95 benchmark. Independent blocker review found no release
+blockers for the current local prototype scope.
+
+This is not yet a production telephony release. Production readiness still requires a
+controlled PSTN call, native platform evidence, measured latency and memory budgets,
+production acoustic echo cancellation/VAD, and authoritative legal/compliance review.
 
 ## Architecture
 
@@ -36,8 +66,8 @@ are translated only inside adapters.
 
 ## Setup
 
-Python 3.11+ is supported. Install the full verified local stack in the configured
-virtual environment:
+The package requires Python 3.11+ and is currently verified on Python 3.12. Install the
+full verified local stack in the configured virtual environment:
 
 ```sh
 .venv/bin/python -m pip install -e '.[realtime]'
@@ -46,11 +76,37 @@ virtual environment:
 Pinned integration versions are `mlx-lm==0.31.3`, `mlx-audio==0.4.8`,
 `livekit-agents==1.6.10`, and its required `livekit==1.1.14`.
 
-Run the complete dependency-free test suite:
+Run the complete external-service-free test suite:
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 ```
+
+Run the standard command-line quality gate before merging a behavioral change:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip check
+.venv/bin/python -m compileall -q src scripts
+git diff --check
+```
+
+For documentation changes, also verify local Markdown links and editor diagnostics with
+the available IDE/tooling. For platform or adapter changes, the native checks listed in
+the validation table below remain mandatory.
+
+An editable install also provides the preferred public commands:
+
+| Command | Purpose |
+|---|---|
+| `adaptive-voice-agent` | Text simulator with mock or MLX conversation model |
+| `adaptive-voice-speech` | WAV-based ASR/TTS diagnostics |
+| `adaptive-voice-local` | Local microphone/speaker conversation |
+| `adaptive-voice-calls` | Inspect persisted outcomes and aggregate metrics |
+| `adaptive-voice-retention` | Purge expired structured records |
+
+The older `speaking-agent-*` command aliases and `python -m speaking_agent...` module
+forms remain available for compatibility.
 
 ## Text Simulation
 
@@ -102,7 +158,7 @@ Talk to the complete local Qwen stack through the Mac microphone and speakers:
 PYTHONPATH=src .venv/bin/python -m speaking_agent.local_voice_chat
 ```
 
-The agent speaks the campaign opening, listens until 700 ms of trailing silence,
+The agent speaks the campaign opening, listens until 550 ms of trailing silence,
 prints what Qwen3-ASR heard, runs the real conversation model, and speaks the Qwen3-TTS
 response. Each turn reports ASR, LLM, TTS-first-audio, and speech-end-to-response
 latency. The local helper applies a warm conversational speaking style by default; use
@@ -119,7 +175,25 @@ PYTHONPATH=src .venv/bin/python -m speaking_agent.local_voice_chat \
   --input-device 2 --output-device 3
 ```
 
-To test through speakers without headphones, use speaker mode:
+For telephone-like conversation, use full-duplex mode:
+
+```sh
+.venv/bin/adaptive-voice-local --full-duplex
+```
+
+The microphone remains active while the agent speaks. Confirmed near-end speech stops
+the current TTS playback, preserves the interruption, and immediately enters the normal
+ASR/LLM/TTS flow. The terminal reports the transcript and interruption count without a
+separate “Listening” phase.
+
+With speakers, full-duplex mode uses the outgoing PCM as an echo reference and rejects
+correlated or low-energy loopback. This is an experimental software echo suppressor, not
+production-grade acoustic echo cancellation. Keep speaker volume moderate. If the agent
+interrupts itself, increase `--barge-in-energy-threshold` or `--echo-gain`; if your voice
+cannot interrupt it, lower those values. `--echo-correlation-threshold` controls how
+closely microphone audio must match recent speaker output before it is rejected.
+
+Use half-duplex speaker mode as the stable fallback in a difficult room:
 
 ```sh
 .venv/bin/adaptive-voice-local --speaker-mode
@@ -141,9 +215,9 @@ PYTHONPATH=src .venv/bin/python -m speaking_agent.local_voice_chat \
   --voice Aiden --style "Speak warmly, naturally, and concisely."
 ```
 
-The helper is intentionally turn-by-turn to make voice, transcription, understanding,
-and response quality easy to judge. Barge-in behavior remains covered by `CallSession`
-and the LiveKit path rather than this local microphone helper.
+Both modes use the same campaign, conversation policy, local models, and structured call
+state. LiveKit is the intended telephony transport path, where endpoint/WebRTC echo
+cancellation is expected to handle acoustic loopback.
 
 ## LiveKit Worker
 
@@ -242,7 +316,12 @@ before its spoken acknowledgement and call teardown.
 
 ## Campaigns
 
-Campaigns are runtime JSON files. The engine contains no real-estate question sequence.
+Campaigns are runtime JSON files. Question order and wording come from configuration
+rather than a hardcoded sequence. The current deterministic grounding policy still
+contains property-domain evidence rules for fields such as intent, location, property
+type, price, timeline, and listing state. Add a pluggable or declarative domain policy
+before treating JSON alone as sufficient for a non-property campaign.
+
 The active local voice campaign is `campaigns/property_owner.json`. That is where you
 give the agent its overall goal and flexible scenario guidance:
 
@@ -273,7 +352,15 @@ The repository includes two examples:
 judgment. They are explicitly passed as strategies rather than dialogue to quote, so the
 agent can answer unexpected turns and vary its language while staying on goal. Exact
 approved facts belong in `faq_answers`; alternate follow-up wording belongs in
-`question_variants`.
+`question_variants`. Compliant `opening_variants` are selected per session so repeated
+calls do not always begin with identical wording.
+
+During a session, the model receives bounded in-memory dialogue history for both the
+owner and agent, plus the current stage, prior question counts, skipped fields, and known
+structured facts. This lets it resolve references, remember what both sides said, and
+avoid repeating an earlier answer or question. Configure the owner-turn bound with
+`behavior.conversation_memory_turns` (default `12`). This in-call history is discarded
+when the session ends and is never written to SQLite call records.
 
 To create another campaign:
 
@@ -291,7 +378,56 @@ To create another campaign:
 
 Campaign loading rejects undeclared outcomes, missing closings/questions/types,
 unsupported field types, invalid retention/attempt settings, and introductions missing
-required disclosures.
+required disclosures. It also rejects prohibited or human-identity claims in every
+directly spoken campaign surface: introductions, openings, variants, questions,
+closings, transfer/voicemail/error messages, and FAQ answers.
+
+## Where to Change What
+
+Choose the narrowest owning surface. Keep campaign-specific behavior in campaign JSON;
+change Python only when the behavior is reusable across campaigns or must be enforced
+outside the model.
+
+| Need | Primary files | How to change it | Change it when |
+|---|---|---|---|
+| Change company identity, goal, wording, fields, FAQs, flow, voice style, or limits | `campaigns/*.json` | Edit configuration, keep a unique `campaign_id`, then run campaign and conversation tests | The behavior belongs to one campaign and fits the existing schema |
+| Add or change campaign schema | `src/speaking_agent/campaign.py`, every campaign JSON, `tests/test_campaign.py` | Add strict parsing/defaults and reject malformed or unsafe values | Multiple campaigns need a new declarative capability |
+| Change DNC, transfer, outcome evidence, field grounding, or response safety | `src/speaking_agent/policy.py`, `src/speaking_agent/text_safety.py` | Implement deterministic evidence rules and adversarial regressions | The rule affects compliance, persisted state, or terminal actions |
+| Change adaptive turn progression or dialogue memory | `src/speaking_agent/conversation.py`, `src/speaking_agent/domain.py` | Preserve policy ownership; update state only from validated evidence | The application must alter what objective/question comes next |
+| Change Qwen prompting, context selection, parsing, or budget | `src/speaking_agent/adapters/llm/qwen_mlx.py` | Keep sparse structured output, the 14,500-character cap, newest dialogue, and required policy context | Natural-language planning needs improvement without weakening policy |
+| Add another LLM | `src/speaking_agent/model.py`, `src/speaking_agent/adapters/llm/`, composition entry points | Implement `ConversationModel`; translate provider output to `ModelInterpretation` | A platform cannot use MLX or a different quality/latency profile is needed |
+| Add or tune ASR/TTS | `src/speaking_agent/speech.py`, `src/speaking_agent/adapters/asr/`, `src/speaking_agent/adapters/tts/`, `src/speaking_agent/delivery.py` | Preserve application PCM/events and cancellation contracts | A new backend, language, voice, or measured quality target requires it |
+| Change endpointing, short-speech handling, or local audio | `src/speaking_agent/turn_detection.py`, `src/speaking_agent/local_voice_chat.py`, `src/speaking_agent/adapters/telephony/sounddevice_local.py` | Tune from captured consented scenarios; keep device/sample-rate behavior explicit | Audio evidence shows missed speech, false turns, echo, or latency problems |
+| Change call lifecycle, barge-in, transfer, or cleanup | `src/speaking_agent/voice_session.py`, `src/speaking_agent/transport.py` | Keep one `CallSession` owner and bounded cancellation/cleanup | Behavior must be identical across local and LiveKit transports |
+| Change LiveKit or controlled outbound SIP | `src/speaking_agent/livekit_worker.py`, `src/speaking_agent/adapters/telephony/livekit_room.py`, `src/speaking_agent/call_cli.py`, `src/speaking_agent/outbound.py` | Keep SDK/SIP types inside adapters and preserve allowlist/suppression gates | Provider behavior or controlled-call requirements change |
+| Change persistence, privacy, retention, or metrics | `src/speaking_agent/records.py`, `src/speaking_agent/recording.py`, `src/speaking_agent/suppression.py`, `src/speaking_agent/adapters/storage/sqlite.py`, `src/speaking_agent/metrics.py` | Migrate explicitly, retain no raw number/transcript, and preserve atomic attempt checks | The structured record contract or reviewed retention policy changes |
+| Change operator workflows | `src/speaking_agent/operator_cli.py`, `src/speaking_agent/retention_worker.py` | Add commands over repository interfaces rather than direct SQL | Operators need a repeatable inspection or maintenance action |
+
+## How to Extend Safely
+
+1. Start with a failing scenario or adapter-contract test in the matching `tests/test_*.py`.
+2. Prefer a campaign-only edit when the schema can express the requirement.
+3. Put critical decisions in policy/application code; treat model output as untrusted
+  suggestions.
+4. Add a protocol or abstraction only when a second implementation or real duplication
+  requires it.
+5. Run focused tests after the first edit, then the complete quality gate above.
+6. For audio, model, LiveKit, SIP, or platform work, also run the native integration on
+  the target hardware. Wheel installation or mocked tests do not establish support.
+7. Update this README for user-visible behavior and update `ROADMAP.md` when an item is
+  completed, split, reprioritized, or newly discovered.
+
+Minimum validation by change type:
+
+| Change type | Required evidence |
+|---|---|
+| Campaign content/schema | Campaign tests plus relevant conversation scenarios |
+| Policy/state/lifecycle | Focused regression, full suite, and failure-path coverage |
+| LLM/ASR/TTS adapter | Contract tests plus one real model smoke on supported hardware |
+| Local audio/turn detection | Unit tests plus microphone/speaker round trip on the target device |
+| LiveKit/SIP | Adapter tests plus controlled room/call evidence; never use an unapproved number |
+| Storage/privacy | Migration, concurrency, retention, and no-sensitive-data assertions |
+| New platform/profile | Clean native install, full gate, hardware round trips, and published measurements |
 
 ## Adapter Replacement
 
@@ -321,6 +457,15 @@ audio hardware, LiveKit, or telephony.
   human to avoid discarding long human responses. Production AMD needs measured data.
 - MLX cancellation is cooperative. Teardown waits for a bounded grace period and
   quarantines a stalled adapter; a native Python worker thread may finish later.
+- Human-identity protection combines campaign-load validation and runtime regex-based
+  filtering. Known variants are covered, but new paraphrases should be added as
+  adversarial tests; truthful AI/automation disclosure must never be weakened.
+- The Qwen prompt is capped at 14,500 characters by dropping oldest dialogue and then
+  optional guidance. Required policy/state/current-turn context is never silently
+  dropped; an irreducible oversized campaign fails explicitly and should be shortened.
+- Campaign wording and question flow are configurable, but deterministic extraction and
+  outcome grounding currently include property-domain logic in `policy.py`. Introduce a
+  tested domain-policy boundary before deploying a materially different campaign type.
 - The example company, wording, retention, and policy values are demonstrations, not
   legal advice. Production use requires authoritative review for identity, consent,
   recording, calling times, retention, transfer, and suppression rules.

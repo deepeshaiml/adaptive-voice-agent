@@ -13,6 +13,10 @@ class SpeechOperationCancelled(SpeechError):
     """The active speech operation was explicitly cancelled."""
 
 
+class SpeechNotRecognizedError(SpeechError):
+    """A detected audio turn did not contain a usable transcript."""
+
+
 @dataclass(frozen=True, slots=True)
 class PcmFormat:
     sample_rate_hz: int

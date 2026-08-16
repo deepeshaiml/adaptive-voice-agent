@@ -19,6 +19,57 @@ The system must remain transparent about required company/caller identification 
 
 ---
 
+# Current Implementation Baseline
+
+Last verified on **2026-08-16**. The repository is now the working
+`adaptive-voice-agent` modular monolith; the internal `speaking_agent` package name is
+retained for compatibility.
+
+Current verified state:
+
+* 161 unit, conversation, lifecycle, storage, and adapter tests pass;
+* local Qwen LLM, Qwen3-ASR, and Qwen3-TTS run on Apple-silicon MLX/Metal;
+* text, WAV, microphone/speaker, half-duplex, speaker, and experimental full-duplex
+  conversation paths are implemented;
+* LiveKit room audio works bidirectionally;
+* outbound SIP dispatch is implemented and restricted to allowlisted controlled tests;
+* SQLite outcomes, keyed suppression, attempt policy, retention, privacy, metrics, and
+  operator tooling are implemented;
+* campaign-driven adaptive guidance, two-sided delivery-aware memory, grounded fields,
+  prompt budgeting, disclosure, DNC, callback, transfer, and identity safeguards are
+  implemented outside provider code where required.
+
+Verified phases:
+
+| Phase | Status |
+|---|---|
+| 1. Conversation core | Complete |
+| 2. Local LLM | Complete on the Apple MLX profile |
+| 3. Local speech | Complete on the Apple MLX/CoreAudio profile |
+| 4. Real-time voice session | Complete for LiveKit room audio and experimental local full duplex |
+| 5. Telephony | Implementation complete; controlled real PSTN acceptance remains blocked on private trunk credentials and an approved number |
+| 6. Persistence/operator view | Complete for the current SQLite profile |
+| 7. Production hardening | Active; portability, benchmarks, production AEC/VAD, PSTN evidence, and compliance review remain |
+
+Do not replace working implementations with speculative architecture. Continue from the
+current baseline, preserve application-owned protocols, and consult `ROADMAP.md` for the
+ordered remaining work and native evidence required for support claims.
+
+The standard command-line gate is:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m pip check
+.venv/bin/python -m compileall -q src scripts
+git diff --check
+```
+
+Documentation changes also require local Markdown-link validation and editor diagnostics
+when that tooling is available. Platform and adapter changes require the native evidence
+defined in `ROADMAP.md`; the command-line gate alone does not establish support.
+
+---
+
 # Development Environment
 
 Initial development environment:
@@ -911,7 +962,7 @@ DO NOT attempt the entire production system in one uncontrolled implementation p
 
 Work incrementally.
 
-## Phase 1 — Conversation Core
+## Phase 1 — Conversation Core (Complete)
 
 Build:
 
@@ -933,7 +984,7 @@ Must run without:
 
 STOP and verify tests.
 
-## Phase 2 — Local LLM
+## Phase 2 — Local LLM (Complete on Apple MLX)
 
 Add the replaceable local LLM adapter.
 
@@ -941,7 +992,7 @@ Verify adaptive conversation using text.
 
 STOP and test.
 
-## Phase 3 — Local Speech
+## Phase 3 — Local Speech (Complete on Apple MLX/CoreAudio)
 
 Add ASR and TTS adapters.
 
@@ -951,7 +1002,7 @@ Measure latency.
 
 STOP and test.
 
-## Phase 4 — Real-Time Voice Session
+## Phase 4 — Real-Time Voice Session (Current Profile Complete)
 
 Integrate LiveKit.
 
@@ -965,7 +1016,7 @@ Implement:
 
 STOP and test locally.
 
-## Phase 5 — Telephony
+## Phase 5 — Telephony (Implemented; Controlled PSTN Verification Remaining)
 
 Add SIP/outbound calling.
 
@@ -982,11 +1033,11 @@ Verify:
 
 STOP and test.
 
-## Phase 6 — Persistence and Operator View
+## Phase 6 — Persistence and Operator View (Complete for SQLite)
 
 Add the minimum required persistence and lead inspection functionality.
 
-## Phase 7 — Production Hardening
+## Phase 7 — Production Hardening (Active)
 
 Only after measured need, add:
 
@@ -1081,38 +1132,84 @@ Maintain concise documentation containing:
 
 ---
 
-# Final Quality Gate
+# Change Ownership and Extension Rules
 
-Before considering any phase complete verify:
+Route changes to the layer that owns the decision. Do not put business policy into an
+adapter or provider-specific behavior into the domain.
 
-* [ ] Simplest practical implementation
-* [ ] Beginner-readable
-* [ ] No unnecessary abstractions
-* [ ] No unnecessary dependencies
-* [ ] Conversation policy separated from infrastructure
-* [ ] Speaking script stored as runtime configuration
-* [ ] Script can be replaced without code changes
-* [ ] Conversation adapts instead of reading script literally
-* [ ] Structured conversation state exists
-* [ ] Transcript is not treated as application state
-* [ ] Critical business rules do not depend solely on the LLM
-* [ ] ASR replaceable
-* [ ] LLM replaceable
-* [ ] TTS replaceable
-* [ ] Telephony replaceable
-* [ ] Storage replaceable
-* [ ] Text-only simulator works
-* [ ] Unit tests work without external services
-* [ ] Conversation scenario tests exist
-* [ ] Interruptions/cancellation handled
-* [ ] Latency measured
-* [ ] Failure paths tested
-* [ ] External resources released after a call
-* [ ] No premature microservices
-* [ ] No premature message broker
-* [ ] No unnecessary vendor lock-in
-* [ ] Security considered
-* [ ] Compliance rules configurable
-* [ ] Current dependencies verified rather than guessed
+| Change | Where | How | When |
+|---|---|---|---|
+| Campaign identity, objective, questions, FAQs, style, fields, or limits | `campaigns/*.json` | Use the existing schema and add campaign/conversation regressions | Use this first when only one campaign needs the behavior |
+| Campaign schema | `src/speaking_agent/campaign.py` plus every campaign and `tests/test_campaign.py` | Parse strictly, validate unsafe/malformed values, and define conservative defaults only when backward-compatible | Add only when multiple campaigns need a new declarative capability |
+| Compliance, outcome evidence, field grounding, or response safety | `policy.py` and `text_safety.py` | Make the decision deterministic and test adversarial phrasing | Use whenever persisted state, hard stops, disclosure, transfer, or terminal behavior is affected |
+| Conversation progression or memory | `conversation.py` and `domain.py` | Keep model suggestions separate from validated state and track delivered rather than merely planned speech | Use for provider-neutral turn behavior |
+| LLM planning/backend | `model.py` and `adapters/llm/` | Preserve `ModelInterpretation`, sparse structured output, required context, and prompt bounds | Add a backend when a platform or measured quality/latency requirement demands it |
+| ASR/TTS contract or backend | `speech.py`, `adapters/asr/`, `adapters/tts/`, and `delivery.py` | Preserve PCM/event/cancellation contracts and campaign context/style | Change after real audio/model evidence identifies a gap |
+| Turn detection or local audio | `turn_detection.py`, `local_voice_chat.py`, and `adapters/telephony/sounddevice_local.py` | Tune against consented captures and explicit device/sample-rate behavior | Change only with measurable missed-speech, echo, noise, or latency evidence |
+| Call lifecycle, interruption, transfer, or cleanup | `voice_session.py` and `transport.py` | Keep one `CallSession` resource owner and bounded cleanup | Change when behavior must apply to every transport |
+| LiveKit/SIP provider behavior | `livekit_worker.py`, `adapters/telephony/livekit_room.py`, `call_cli.py`, and `outbound.py` | Keep SDK types in adapters and retain allowlist/suppression gates | Change for verified provider behavior or a controlled-call requirement |
+| Persistence/privacy/retention | `records.py`, `recording.py`, `suppression.py`, `adapters/storage/sqlite.py`, and `metrics.py` | Use explicit migrations, atomic policy checks, and no raw number/transcript storage | Change only from a reviewed data contract or measured deployment need |
+
+Required working sequence:
+
+1. Identify one owning layer and one failing or missing scenario.
+2. Add the smallest focused regression or native probe.
+3. Make the narrow implementation change and run that check immediately.
+4. Run the full local gate before considering the change complete.
+5. Run real model/audio/LiveKit/SIP/platform checks when those surfaces changed.
+6. Update `README.md` for user-visible behavior and `ROADMAP.md` for status, ordering,
+   acceptance evidence, or newly discovered work.
+
+Never mark a platform supported from package installation, mocks, or CI alone. Native
+hardware execution, audio round trips, explicit acceleration reporting, and published
+measurements are required.
+
+---
+
+# Current Local Prototype Quality Gate
+
+Verified on 2026-08-16 for the current Apple-silicon local profile:
+
+* [x] Simplest practical implementation
+* [x] Beginner-readable
+* [x] No unnecessary abstractions
+* [x] No unnecessary dependencies
+* [x] Conversation policy separated from infrastructure
+* [x] Speaking script stored as runtime configuration
+* [x] Campaign wording and question flow can be replaced without code changes
+* [x] Conversation adapts instead of reading script literally
+* [x] Structured conversation state exists
+* [x] Transcript is not treated as application state
+* [x] Critical business rules do not depend solely on the LLM
+* [x] ASR replaceable
+* [x] LLM replaceable
+* [x] TTS replaceable
+* [x] Telephony replaceable
+* [x] Storage replaceable
+* [x] Text-only simulator works
+* [x] Unit tests work without external services
+* [x] Conversation scenario tests exist
+* [x] Interruptions/cancellation handled
+* [x] Latency measured
+* [x] Failure paths tested
+* [x] External resources released after a call
+* [x] No premature microservices
+* [x] No premature message broker
+* [x] No unnecessary vendor lock-in
+* [x] Security considered
+* [x] Compliance rules configurable
+* [x] Current dependencies verified rather than guessed
+
+Remaining production gates:
+
+* [ ] Complete and document one controlled real PSTN validation matrix.
+* [ ] Establish repeatable P50/P95 latency, memory, and real-time-factor budgets.
+* [ ] Validate production AEC, noise suppression, VAD, and no-headphone barge-in across
+  representative rooms and devices.
+* [ ] Add and natively validate explicit Linux/Windows/portable runtime profiles.
+* [ ] Add a declarative or pluggable deterministic domain-policy boundary before using
+  the engine for materially non-property campaigns.
+* [ ] Obtain authoritative review for identity, consent, recording, calling windows,
+  retention, transfer, and suppression configuration before production use.
 
 > **Build the smallest working real-time conversational calling system first. Make the conversation engine independent of the speech models and telephony provider. Treat the speaking script as configurable policy, not hardcoded dialogue.**

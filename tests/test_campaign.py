@@ -19,9 +19,24 @@ class CampaignTests(unittest.TestCase):
             ("property_location", "property_type"),
         )
         self.assertIn("intent", campaign.question_variants)
+        self.assertGreaterEqual(len(campaign.opening_variants), 1)
         self.assertIn("flat", campaign.field_allowed_values["property_type"])
+        self.assertIn(
+            "Dubai Marina",
+            campaign.field_extraction_hints["property_location"],
+        )
         self.assertIn("Dubai", campaign.conversation_brief)
         self.assertGreaterEqual(len(campaign.scenario_playbook), 1)
+        self.assertEqual(campaign.voice_style["personality"].split(",")[0], "Warm")
+        self.assertGreaterEqual(len(campaign.natural_conversation_rules), 1)
+        self.assertEqual(campaign.conversation_flow[0]["stage"], "OPEN")
+        self.assertGreaterEqual(len(campaign.field_collection_rules), 1)
+        self.assertIn("acknowledgements", campaign.sample_phrases)
+        self.assertIn(
+            "allow_owner_to_interrupt",
+            campaign.interruption_and_silence_handling,
+        )
+        self.assertIn("Jumeirah Village Circle", campaign.speech_recognition_context)
 
     def test_rejects_a_campaign_without_questions_for_configured_fields(self) -> None:
         campaign = load_campaign(CAMPAIGN_PATH)
@@ -110,6 +125,23 @@ class CampaignTests(unittest.TestCase):
                         }
                     )
 
+    def test_rejects_invalid_field_extraction_hints(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+        invalid_configs = (
+            {"unexpected": ["value"]},
+            {"property_location": []},
+            {"currently_listed": ["yes"]},
+        )
+        for field_extraction_hints in invalid_configs:
+            with self.subTest(field_extraction_hints=field_extraction_hints):
+                with self.assertRaisesRegex(ValueError, "extraction hints"):
+                    type(campaign).from_dict(
+                        {
+                            **campaign.__dict__,
+                            "field_extraction_hints": field_extraction_hints,
+                        }
+                    )
+
     def test_retention_must_cover_attempt_policy_horizons(self) -> None:
         campaign = load_campaign(CAMPAIGN_PATH)
         behavior = {
@@ -128,6 +160,10 @@ class CampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "required_disclosures"):
             type(campaign).from_dict(
                 {**campaign.__dict__, "required_disclosures": [""]}
+            )
+        with self.assertRaisesRegex(ValueError, "required_disclosures"):
+            type(campaign).from_dict(
+                {**campaign.__dict__, "required_disclosures": "Acme Property"}
             )
 
     def test_rejects_question_for_unconfigured_field(self) -> None:
@@ -166,6 +202,15 @@ class CampaignTests(unittest.TestCase):
                     {"when": "Owner asks a question.", "strategy": ""}
                 ]
             },
+            {"voice_style": {"tone": ""}},
+            {"natural_conversation_rules": [""]},
+            {"field_collection_rules": [""]},
+            {"sample_phrases": {"acknowledgements": [""]}},
+            {"interruption_and_silence_handling": {"brief_pause_behavior": ""}},
+            {"hard_stop_context_rules": [""]},
+            {"conversation_flow": [{"stage": "OPEN"}]},
+            {"opening_variants": ["Hello without disclosures."]},
+            {"speech_recognition_context": ["not", "a", "string"]},
         )
         for invalid in invalid_configs:
             with self.subTest(invalid=invalid):
@@ -188,6 +233,7 @@ class CampaignTests(unittest.TestCase):
             "max_unclear_retries": "two",
             "max_model_failures": 0,
             "model_error_message": "",
+            "conversation_memory_turns": 0,
         }
         for key, value in invalid_values.items():
             with self.subTest(key=key):
@@ -210,6 +256,64 @@ class CampaignTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     type(campaign).from_dict({**campaign.__dict__, **invalid})
+
+    def test_rejects_faq_answer_with_prohibited_statement(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+
+        for unsafe_answer in (
+            "I am a human",
+            "I'm human.",
+            "I’m a human.",
+            "I’m an actual human.",
+            "I'm actually a human caller.",
+            "You’re speaking with a real person.",
+            "You're talking to a real person.",
+        ):
+            with self.subTest(unsafe_answer=unsafe_answer):
+                with self.assertRaisesRegex(ValueError, "prohibited statements"):
+                    type(campaign).from_dict(
+                        {
+                            **campaign.__dict__,
+                            "faq_answers": {"are you human": unsafe_answer},
+                        }
+                    )
+
+    def test_rejects_prohibited_claim_in_every_directly_spoken_message(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+        unsafe = "I'm a live human agent calling you."
+        unsafe_introduction = f"{campaign.introduction} {unsafe}"
+        cases = {
+            "introduction": {
+                "introduction": unsafe_introduction,
+                "opening": f"{unsafe_introduction} {campaign.questions[campaign.opening_field]}",
+            },
+            "opening": {"opening": f"{campaign.opening} {unsafe}"},
+            "opening_variant": {
+                "opening_variants": [f"{campaign.opening} {unsafe}"]
+            },
+            "question": {
+                "questions": {**campaign.questions, "intent": unsafe}
+            },
+            "question_variant": {
+                "question_variants": {**campaign.question_variants, "intent": [unsafe]}
+            },
+            "closing": {
+                "closing_messages": {**campaign.closing_messages, "UNKNOWN": unsafe}
+            },
+            "transfer": {"transfer_unavailable_message": unsafe},
+            "voicemail": {
+                "voicemail_message": f"{campaign.introduction} {unsafe}"
+            },
+            "faq": {"faq_answers": {"are you human": unsafe}},
+            "model_error": {
+                "behavior": {**campaign.behavior, "model_error_message": unsafe}
+            },
+        }
+
+        for surface, overrides in cases.items():
+            with self.subTest(surface=surface):
+                with self.assertRaisesRegex(ValueError, "prohibited statements"):
+                    type(campaign).from_dict({**campaign.__dict__, **overrides})
 
     def test_voicemail_message_requires_disclosures(self) -> None:
         campaign = load_campaign(CAMPAIGN_PATH)
