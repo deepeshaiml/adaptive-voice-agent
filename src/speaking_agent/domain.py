@@ -19,6 +19,49 @@ class SessionAction(StrEnum):
     TRANSFER = "TRANSFER"
 
 
+@dataclass(frozen=True, slots=True)
+class ConversationContext:
+    recipient_name: str | None = None
+    property_reference: str | None = None
+    known_fields: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name, maximum_length in (
+            ("recipient_name", 120),
+            ("property_reference", 200),
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            normalized = " ".join(value.split())
+            if not normalized or len(normalized) > maximum_length:
+                raise ValueError(
+                    f"Conversation metadata {name} must contain 1-{maximum_length} characters"
+                )
+            object.__setattr__(self, name, normalized)
+        if bool(self.recipient_name) != bool(self.property_reference):
+            raise ValueError(
+                "Conversation metadata recipient_name and property_reference "
+                "must be provided together"
+            )
+        normalized_fields: dict[str, Any] = {}
+        for name, value in self.known_fields.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Conversation metadata field names must be non-empty strings")
+            if isinstance(value, str):
+                value = " ".join(value.split())
+                if not value or len(value) > 200:
+                    raise ValueError(
+                        f"Conversation metadata field {name!r} must contain 1-200 characters"
+                    )
+            elif not isinstance(value, (bool, int, float)):
+                raise ValueError(
+                    f"Conversation metadata field {name!r} has an unsupported value"
+                )
+            normalized_fields[name.strip()] = value
+        object.__setattr__(self, "known_fields", normalized_fields)
+
+
 @dataclass
 class ConversationState:
     call_id: str

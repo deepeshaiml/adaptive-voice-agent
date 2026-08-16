@@ -32,7 +32,7 @@ Status last verified on **2026-08-16** on Apple-silicon macOS with Python 3.12:
 | SQLite outcomes, suppression, retention, and metrics | Complete and tested |
 | Linux, Windows, CUDA, and portable inference | Not yet integrated or natively verified |
 
-The current validation passes **161 tests**, `pip check`, bytecode compilation, diff
+The current validation passes **214 tests**, `pip check`, bytecode compilation, diff
 validation, local Markdown-link checks, and editor diagnostics. A real local Qwen
 planning smoke completed in 1.214 seconds for one warm single-turn scenario; this is a
 smoke measurement, not a P50/P95 benchmark. Independent blocker review found no release
@@ -162,8 +162,8 @@ The agent speaks the campaign opening, listens until 550 ms of trailing silence,
 prints what Qwen3-ASR heard, runs the real conversation model, and speaks the Qwen3-TTS
 response. Each turn reports ASR, LLM, TTS-first-audio, and speech-end-to-response
 latency. The local helper applies a warm conversational speaking style by default; use
-`--style` to replace it. Audio and transcripts are not written to disk. Press `Ctrl-C`
-to stop.
+`--style` to replace it. Audio and transcripts are not written to disk by default.
+Press `Ctrl-C` to stop.
 
 On first use, allow microphone access for VS Code or the terminal in macOS **System
 Settings > Privacy & Security > Microphone**. Headphones prevent the microphone from
@@ -180,6 +180,66 @@ For telephone-like conversation, use full-duplex mode:
 ```sh
 .venv/bin/adaptive-voice-local --full-duplex
 ```
+
+To practice the personalized three-stage opening with fake data:
+
+```sh
+.venv/bin/adaptive-voice-local --full-duplex --demo-metadata
+```
+
+That demo identifies the disclosed automated assistant as Sam, asks for Mr. Ahmed,
+mentions a fake apartment in Marina Gate only after recipient confirmation, asks whether
+it is a good time, and then starts qualification. The safe default remains the generic
+opening when metadata is omitted.
+
+Supply reviewed metadata explicitly when it becomes available:
+
+```sh
+.venv/bin/adaptive-voice-local --full-duplex \
+  --recipient-name "Ms. Fatima" \
+  --property-reference "your villa in Dubai Hills" \
+  --property-location "Dubai Hills Estate" \
+  --property-type villa
+```
+
+Recipient name and property reference must be supplied together. They stay in the
+in-memory conversation context and are not added to persisted call records. Verified
+structured fields such as location/type seed conversation state and may therefore appear
+in the structured outcome. Never populate metadata from an unverified enrichment source.
+
+### Consent-Gated Audio Recording
+
+Record a local full-duplex quality session only after obtaining and documenting the
+required consent:
+
+```sh
+.venv/bin/adaptive-voice-local --full-duplex --demo-metadata \
+  --record-audio \
+  --recording-consent-reference local-self-test-20260816
+```
+
+The consent reference is an external audit identifier, not proof that consent was
+legally sufficient. The operator remains responsible for approved notice, consent,
+access, training use, and deletion rules. Local recording requires full duplex; without
+`--record-audio`, no audio file is created.
+
+Artifacts are written beneath `data/recordings/YYYY-MM-DD/` by default:
+
+- `<call-id>.wav`: 16 kHz stereo PCM, owner on channel 1 (left) and agent on channel 2
+  (right). The agent channel accepts only transport-confirmed playout; queued audio
+  discarded by barge-in is not recorded.
+- `<call-id>.json`: consent reference, purpose, campaign/call IDs, timestamps, expiry,
+  channel map, duration, and SHA-256 digest. It contains no transcript, phone number,
+  recipient name, or property reference.
+
+Directories are owner-only (`0700`) and files are owner-only (`0600`). Raw voice can
+still identify a person and contain sensitive statements. The application does not
+encrypt or de-identify recordings, label training examples, or establish rights to train
+a model. Use encrypted storage and a separately reviewed de-identification/access/export
+workflow before moving recordings off the controlled machine or using them for training.
+Recording creation and retention refuse symlinked storage components, and an active-call
+marker prevents retention from removing an in-progress call directory. Stale crash
+partials/orphan WAVs are removed after the retention worker's grace period.
 
 The microphone remains active while the agent speaks. Confirmed near-end speech stops
 the current TTS playback, preserves the interruption, and immediately enters the normal
@@ -214,6 +274,13 @@ Raise it in a noisy room. Voice character can be tested with `--voice` and `--st
 PYTHONPATH=src .venv/bin/python -m speaking_agent.local_voice_chat \
   --voice Aiden --style "Speak warmly, naturally, and concisely."
 ```
+
+Qwen TTS now defaults to greedy decoding (`--tts-temperature 0`) so the same
+text/voice/style produces repeatable PCM and is much less likely to drift in speaker
+identity or delivery between turns. A native check on the pinned checkpoint produced
+identical hashes for two repeated adapter generations. To deliberately restore more
+prosodic variation, use for example `--tts-temperature 0.3 --tts-top-k 30`; sampled
+decoding can also reintroduce audible voice/style variation.
 
 Both modes use the same campaign, conversation policy, local models, and structured call
 state. LiveKit is the intended telephony transport path, where endpoint/WebRTC echo
@@ -265,6 +332,34 @@ PYTHONPATH=src .venv/bin/python -m speaking_agent.call_cli \
   +<controlled-number> --execute
 ```
 
+Optional reviewed personalization uses the same flags as local mode and is forwarded in
+private LiveKit job metadata; the dry-run summary reports only whether personalization is
+enabled:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m speaking_agent.call_cli \
+  +<controlled-number> \
+  --recipient-name "Mr. Ahmed" \
+  --property-reference "your apartment in Marina Gate" \
+  --property-location "Dubai Marina" \
+  --property-type apartment
+```
+
+For a controlled LiveKit/SIP recording, first set `behavior.recording_enabled` to `true`
+in the reviewed campaign, configure `SPEAKING_AGENT_RECORDING_DIRECTORY`, and dispatch
+with a per-call consent reference:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m speaking_agent.call_cli \
+  +<controlled-number> \
+  --recording-consent-reference consent-ticket-42 \
+  --execute
+```
+
+The worker blocks before dialing when recording is enabled but the consent reference is
+missing or invalid. A reference is required even if the campaign opening also contains a
+recording notice; configure both according to authoritative requirements.
+
 The worker blocks non-allowlisted numbers, invalid E.164 input, active do-not-contact
 records, excessive attempts, too-short retry intervals, missing suppression keys, and
 unconfigured trunks. Non-test campaigns must additionally configure a reviewed timezone
@@ -294,13 +389,16 @@ SQLite defaults to `data/speaking_agent.db`. Records include connection result, 
 kind, lead outcome, validated fields, interruption count, duration, and latency metrics.
 They do not contain transcripts or raw telephone numbers. Do-not-contact and attempt
 tracking use a keyed HMAC fingerprint. Structured call records and attempt history are
-assigned per-row expirations using their campaign's `data_retention_days`; suppression
-entries are retained. Run the retention service beside the call worker so expired data is
-removed even while no calls are arriving:
+assigned per-row expirations using their campaign's `data_retention_days`; recording
+manifests use the same campaign horizon, while suppression entries are retained. Run the
+retention service beside the call worker so expired structured rows, recording WAVs, and
+manifests are removed even while no calls are arriving:
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m speaking_agent.retention_worker \
-  --database data/speaking_agent.db --interval-seconds 3600
+  --database data/speaking_agent.db \
+  --recording-directory data/recordings \
+  --interval-seconds 3600
 ```
 
 Populated databases created before per-row expiration fail closed. Migrate once with a
@@ -351,9 +449,22 @@ The repository includes two examples:
 `conversation_brief`, `conversation_guidelines`, and `scenario_playbook` guide Qwen's
 judgment. They are explicitly passed as strategies rather than dialogue to quote, so the
 agent can answer unexpected turns and vary its language while staying on goal. Exact
-approved facts belong in `faq_answers`; alternate follow-up wording belongs in
-`question_variants`. Compliant `opening_variants` are selected per session so repeated
-calls do not always begin with identical wording.
+approved facts belong in `faq_answers`; standalone ASR/paraphrase routes to those facts
+belong in `faq_aliases`; alternate follow-up wording belongs in `question_variants`.
+FAQ aliases are exact punctuation-insensitive routes, so mixed FAQ-and-intent turns still
+go through the model with the approved answer in context. Put a canonical FAQ question
+in `faq_answer_only` when its approved answer should be spoken without immediately
+appending the next qualification question, such as identity clarification or a complaint
+about repetition. Compliant `opening_variants` are selected per session so repeated calls
+do not always begin with identical wording.
+
+The detailed property campaign includes conditional guidance for owners who already use
+an agent, request WhatsApp, ask about a buyer or valuation, state a high expected price,
+or volunteer tenant/rental timing. These are strategies rather than scripts. They do not
+grant new tools: the example cannot send WhatsApp, inspect transactions, calculate a live
+valuation, or verify a buyer. It states those limits instead of promising work it cannot
+perform. An explicit refusal ends the call without further probing, and an explicit
+future-contact refusal additionally enters do-not-contact suppression.
 
 During a session, the model receives bounded in-memory dialogue history for both the
 owner and agent, plus the current stage, prior question counts, skipped fields, and known
@@ -370,11 +481,18 @@ To create another campaign:
    field.
 4. Configure hard stops, FAQs, prohibited statements, terminal/closing behavior,
    voicemail text, attempt limits, retention, and model failure bounds.
-  Set `recording_enabled` explicitly. This prototype supports `false`; `true` blocks the
-  call until an audited recording/consent adapter is implemented.
+  Set `recording_enabled` explicitly. `true` enables dual-channel recording only when
+  each controlled dispatch also carries a valid consent reference; otherwise the call
+  is blocked before dialing.
 5. Keep `controlled_test_mode` enabled for controlled tests. Before disabling it, add a
    legally reviewed timezone and calling window.
 6. Add regression scenarios and run the full suite.
+
+Optional `personalized_preamble` configuration contains exactly three question
+templates: `recipient_confirmation` with `{recipient_name}`, `property_timing` with
+`{property_reference}`, and `qualification` without placeholders. The first template
+must include all required AI/company disclosures. Metadata is opt-in; without it, normal
+`opening`/`opening_variants` behavior is unchanged.
 
 Campaign loading rejects undeclared outcomes, missing closings/questions/types,
 unsupported field types, invalid retention/attempt settings, and introductions missing
@@ -401,6 +519,7 @@ outside the model.
 | Change call lifecycle, barge-in, transfer, or cleanup | `src/speaking_agent/voice_session.py`, `src/speaking_agent/transport.py` | Keep one `CallSession` owner and bounded cancellation/cleanup | Behavior must be identical across local and LiveKit transports |
 | Change LiveKit or controlled outbound SIP | `src/speaking_agent/livekit_worker.py`, `src/speaking_agent/adapters/telephony/livekit_room.py`, `src/speaking_agent/call_cli.py`, `src/speaking_agent/outbound.py` | Keep SDK/SIP types inside adapters and preserve allowlist/suppression gates | Provider behavior or controlled-call requirements change |
 | Change persistence, privacy, retention, or metrics | `src/speaking_agent/records.py`, `src/speaking_agent/recording.py`, `src/speaking_agent/suppression.py`, `src/speaking_agent/adapters/storage/sqlite.py`, `src/speaking_agent/metrics.py` | Migrate explicitly, retain no raw number/transcript, and preserve atomic attempt checks | The structured record contract or reviewed retention policy changes |
+| Change consented audio capture or recording retention | `src/speaking_agent/audio_recording.py`, `src/speaking_agent/voice_session.py`, transports, `src/speaking_agent/retention_worker.py` | Preserve explicit per-call consent, private dual-channel artifacts, transport-confirmed playout, and expiry manifests | A reviewed quality/training workflow changes |
 | Change operator workflows | `src/speaking_agent/operator_cli.py`, `src/speaking_agent/retention_worker.py` | Add commands over repository interfaces rather than direct SQL | Operators need a repeatable inspection or maintenance action |
 
 ## How to Extend Safely
@@ -466,6 +585,16 @@ audio hardware, LiveKit, or telephony.
 - Campaign wording and question flow are configurable, but deterministic extraction and
   outcome grounding currently include property-domain logic in `policy.py`. Introduce a
   tested domain-policy boundary before deploying a materially different campaign type.
+- Greedy Qwen TTS removes sampling variance and repeated-text output is deterministic on
+  the verified checkpoint. Perceptual consistency across different sentences still
+  requires listening benchmarks; use `--tts-temperature 0` for the most stable profile.
+- Consented audio recording stores sensitive raw PCM and a minimal manifest. Application-
+  level encryption, de-identification, annotation, approval workflow, and training-data
+  export are not implemented; owner-only permissions and retention are not substitutes
+  for those production controls.
+- SoundDevice reports callback-consumed agent PCM precisely. LiveKit currently reports
+  completed playout batches; when a LiveKit turn is interrupted, its agent-channel prefix
+  may be omitted because the SDK path does not expose an exact played-sample cursor.
 - The example company, wording, retention, and policy values are demonstrations, not
   legal advice. Production use requires authoritative review for identity, consent,
   recording, calling times, retention, transfer, and suppression rules.

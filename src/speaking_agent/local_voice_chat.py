@@ -11,6 +11,7 @@ from threading import Event
 import time
 from typing import Any
 
+from speaking_agent.audio_recording import RecordingConsent, WaveConversationRecorder
 from speaking_agent.adapters.asr.qwen_mlx import (
     DEFAULT_ASR_MODEL_PATH,
     QwenMlxSpeechRecognizer,
@@ -31,7 +32,7 @@ from speaking_agent.adapters.tts.qwen_mlx import (
 from speaking_agent.campaign import load_campaign
 from speaking_agent.conversation import ConversationSession
 from speaking_agent.delivery import campaign_voice_style
-from speaking_agent.domain import AgentReply, SessionAction
+from speaking_agent.domain import AgentReply, ConversationContext, SessionAction
 from speaking_agent.recording import latency_snapshot
 from speaking_agent.speech import AudioFrame, PcmFormat, SynthesisOptions
 from speaking_agent.turn_detection import (
@@ -49,6 +50,53 @@ class TurnMetrics:
     tts_first_audio_seconds: float
     response_first_audio_seconds: float
     tts_playout_seconds: float
+
+
+def _conversation_context(args: argparse.Namespace) -> ConversationContext:
+    if args.demo_metadata:
+        return ConversationContext(
+            recipient_name="Mr. Ahmed",
+            property_reference="your apartment in Marina Gate, Dubai Marina",
+            known_fields={
+                "property_location": "Dubai Marina",
+                "property_type": "apartment",
+            },
+        )
+    known_fields = {
+        name: value
+        for name, value in (
+            ("property_location", args.property_location),
+            ("property_type", args.property_type),
+        )
+        if value is not None
+    }
+    return ConversationContext(
+        recipient_name=args.recipient_name,
+        property_reference=args.property_reference,
+        known_fields=known_fields,
+    )
+
+
+def _audio_recorder(args: argparse.Namespace) -> WaveConversationRecorder | None:
+    if not args.record_audio:
+        return None
+    return WaveConversationRecorder(
+        args.recording_directory,
+        RecordingConsent(args.recording_consent_reference),
+    )
+
+
+def _recording_error(result: Any, recorder: WaveConversationRecorder) -> str | None:
+    cleanup_errors = tuple(
+        error
+        for error in result.cleanup_errors
+        if error.startswith("audio_recorder:")
+    )
+    if cleanup_errors:
+        return "; ".join(cleanup_errors)
+    if recorder.artifact is None:
+        return "recording produced no audio artifact"
+    return None
 
 
 def _device(value: str | None) -> int | str | None:
@@ -273,6 +321,7 @@ async def _run_full_duplex(
             ready = True
         print(f"Agent: {reply.text}", flush=True)
 
+    audio_recorder = _audio_recorder(args)
     session = CallSession(
         campaign=campaign,
         model=model,
@@ -289,6 +338,8 @@ async def _run_full_duplex(
         recognition_language=args.language,
         recognition_context=campaign.speech_recognition_context,
         transfer_available=False,
+        conversation_context=_conversation_context(args),
+        audio_recorder=audio_recorder,
     )
     print("Loading local Qwen LLM, ASR, and TTS models...", flush=True)
     result = await session.run()
@@ -299,11 +350,19 @@ async def _run_full_duplex(
     )
     print("Result:")
     print(json.dumps(asdict(result.lead), indent=2))
+    if audio_recorder is not None:
+        recording_error = _recording_error(result, audio_recorder)
+        if recording_error is not None:
+            print(f"Recording failed: {recording_error}", file=sys.stderr)
+            return 2
+        print(f"Recording: {audio_recorder.artifact.audio_path}")
+        print(f"Recording manifest: {audio_recorder.artifact.manifest_path}")
     return 0
 
 
 async def run(args: argparse.Namespace, audio: Any) -> int:
     campaign = load_campaign(args.campaign)
+    conversation_context = _conversation_context(args)
     voice_style = args.style or campaign_voice_style(campaign)
     model = QwenMlxConversationModel(
         MlxLmBackend(args.model_path or DEFAULT_MODEL_PATH)
@@ -316,8 +375,10 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
         default_voice=args.voice,
         default_language=args.language,
         default_style=voice_style,
+        temperature=args.tts_temperature,
+        top_k=args.tts_top_k,
     )
-    session = ConversationSession(campaign, model)
+    session = ConversationSession(campaign, model, context=conversation_context)
     input_device = _device(args.input_device)
     output_device = _device(args.output_device)
     turn_config = TurnDetectionConfig(
@@ -459,11 +520,46 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-path")
     parser.add_argument("--asr-model-path")
     parser.add_argument("--tts-model-path")
+    parser.add_argument(
+        "--tts-temperature",
+        type=float,
+        default=0.0,
+        help="Qwen TTS sampling temperature; 0 gives the most consistent voice",
+    )
+    parser.add_argument(
+        "--tts-top-k",
+        type=int,
+        default=50,
+        help="Qwen TTS top-k sampling; relevant only above temperature 0",
+    )
     parser.add_argument("--voice", default="Aiden")
     parser.add_argument("--language", default="English")
     parser.add_argument(
         "--style",
         help="Override the campaign voice style for this run",
+    )
+    parser.add_argument(
+        "--demo-metadata",
+        action="store_true",
+        help="Use fake Mr. Ahmed and Marina Gate metadata for local testing",
+    )
+    parser.add_argument("--recipient-name")
+    parser.add_argument("--property-reference")
+    parser.add_argument("--property-location")
+    parser.add_argument("--property-type")
+    parser.add_argument(
+        "--record-audio",
+        action="store_true",
+        help="Store consented owner/agent audio as a private stereo WAV",
+    )
+    parser.add_argument(
+        "--recording-consent-reference",
+        help="External consent/audit reference required for recording",
+    )
+    parser.add_argument(
+        "--recording-directory",
+        type=Path,
+        default=Path("data/recordings"),
     )
     parser.add_argument("--input-device")
     parser.add_argument("--output-device")
@@ -520,6 +616,31 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--list-devices", action="store_true")
     args = parser.parse_args(arguments)
+    explicit_metadata = any(
+        getattr(args, name) is not None
+        for name in (
+            "recipient_name",
+            "property_reference",
+            "property_location",
+            "property_type",
+        )
+    )
+    if args.demo_metadata and explicit_metadata:
+        parser.error("--demo-metadata cannot be combined with explicit metadata")
+    if bool(args.recipient_name) != bool(args.property_reference):
+        parser.error(
+            "--recipient-name and --property-reference must be provided together"
+        )
+    if args.record_audio and not args.full_duplex:
+        parser.error("--record-audio currently requires --full-duplex")
+    if args.record_audio and not args.recording_consent_reference:
+        parser.error("--record-audio requires --recording-consent-reference")
+    if args.recording_consent_reference and not args.record_audio:
+        parser.error("--recording-consent-reference requires --record-audio")
+    if not 0 <= args.tts_temperature <= 2:
+        parser.error("--tts-temperature must be between 0 and 2")
+    if args.tts_top_k < 0:
+        parser.error("--tts-top-k cannot be negative")
     if args.listen_timeout_seconds <= 0:
         parser.error("--listen-timeout-seconds must be positive")
     if not 0 < args.energy_threshold <= 1:

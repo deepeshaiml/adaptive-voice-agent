@@ -27,7 +27,7 @@ retained for compatibility.
 
 Current verified state:
 
-* 161 unit, conversation, lifecycle, storage, and adapter tests pass;
+* 214 unit, conversation, lifecycle, storage, and adapter tests pass;
 * local Qwen LLM, Qwen3-ASR, and Qwen3-TTS run on Apple-silicon MLX/Metal;
 * text, WAV, microphone/speaker, half-duplex, speaker, and experimental full-duplex
   conversation paths are implemented;
@@ -35,6 +35,9 @@ Current verified state:
 * outbound SIP dispatch is implemented and restricted to allowlisted controlled tests;
 * SQLite outcomes, keyed suppression, attempt policy, retention, privacy, metrics, and
   operator tooling are implemented;
+* optional consent-gated stereo WAV capture stores owner/agent channels with private
+  permissions, integrity/expiry manifests, and retention purge; it remains off by
+  default and does not persist transcripts;
 * campaign-driven adaptive guidance, two-sided delivery-aware memory, grounded fields,
   prompt budgeting, disclosure, DNC, callback, transfer, and identity safeguards are
   implemented outside provider code where required.
@@ -1149,6 +1152,7 @@ adapter or provider-specific behavior into the domain.
 | Call lifecycle, interruption, transfer, or cleanup | `voice_session.py` and `transport.py` | Keep one `CallSession` resource owner and bounded cleanup | Change when behavior must apply to every transport |
 | LiveKit/SIP provider behavior | `livekit_worker.py`, `adapters/telephony/livekit_room.py`, `call_cli.py`, and `outbound.py` | Keep SDK types in adapters and retain allowlist/suppression gates | Change for verified provider behavior or a controlled-call requirement |
 | Persistence/privacy/retention | `records.py`, `recording.py`, `suppression.py`, `adapters/storage/sqlite.py`, and `metrics.py` | Use explicit migrations, atomic policy checks, and no raw number/transcript storage | Change only from a reviewed data contract or measured deployment need |
+| Consented audio capture | `audio_recording.py`, `voice_session.py`, `retention_worker.py`, transports, and composition CLIs/workers | Keep recording off by default; require a per-call consent reference, separate owner/agent channels, record only transport-confirmed playout, use owner-only artifacts, and purge by campaign retention | Change only from a reviewed quality/training and privacy requirement |
 
 Required working sequence:
 
@@ -1209,6 +1213,8 @@ Remaining production gates:
 * [ ] Add and natively validate explicit Linux/Windows/portable runtime profiles.
 * [ ] Add a declarative or pluggable deterministic domain-policy boundary before using
   the engine for materially non-property campaigns.
+* [ ] Add encryption, de-identification, role-based recording review, annotation lineage,
+  and approved training-data export/deletion before using audio for model training.
 * [ ] Obtain authoritative review for identity, consent, recording, calling windows,
   retention, transfer, and suppression configuration before production use.
 

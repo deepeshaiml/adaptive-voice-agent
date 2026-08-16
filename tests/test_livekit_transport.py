@@ -17,6 +17,9 @@ class FakeAudioSource:
     def clear_queue(self) -> None:
         self.cleared = True
 
+    async def wait_for_playout(self) -> None:
+        return None
+
     async def aclose(self) -> None:
         return None
 
@@ -98,6 +101,36 @@ class LiveKitTransportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(source.frames[0].samples_per_channel, 480)
         self.assertTrue(source.cleared)
+
+    async def test_reports_only_completed_playout_and_discards_stopped_audio(self) -> None:
+        async def action():
+            return None
+
+        transport = LiveKitRoomTransport(
+            room=object(),
+            connect_room=action,
+            wait_for_participant=action,
+            hang_up_handler=action,
+        )
+        transport._rtc = type("Rtc", (), {"AudioFrame": FakeRtcFrame})
+        transport._audio_source = FakeAudioSource()
+        played: list[AudioFrame] = []
+        transport.set_playout_observer(
+            lambda frame, started_at: played.append(frame)
+        )
+        interrupted = AudioFrame(data=bytes(960), format=PcmFormat(24_000))
+
+        await transport.send_audio(interrupted)
+        await transport.stop_audio()
+        await transport.wait_for_playout()
+
+        self.assertEqual(played, [])
+
+        delivered = AudioFrame(data=bytes(960), format=PcmFormat(24_000))
+        await transport.send_audio(delivered)
+        await transport.wait_for_playout()
+
+        self.assertEqual(played, [delivered])
 
     async def test_rejects_wrong_output_sample_rate(self) -> None:
         async def action():

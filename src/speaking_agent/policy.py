@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import re
 from typing import Any
 
 from speaking_agent.campaign import Campaign
 from speaking_agent.domain import ConversationState
 from speaking_agent.model import ModelInterpretation
-from speaking_agent.text_safety import claims_human_identity, normalize_text
+from speaking_agent.text_safety import (
+    claims_human_identity,
+    normalize_match_text,
+    normalize_text,
+)
 
 
 def _normalized(text: str) -> str:
     return normalize_text(text)
+
+
+@dataclass(frozen=True)
+class DirectFaqResponse:
+    answer: str
+    resume_objective: bool
 
 
 class ConversationPolicy:
@@ -29,6 +40,12 @@ class ConversationPolicy:
             dnc_matches and not self._is_temporary_contact_pause(normalized_utterance)
         ):
             return "DO_NOT_CONTACT"
+        if (
+            "NOT_INTERESTED" in self.campaign.desired_outcomes
+            and normalize_match_text(utterance)
+            in {"stop", "please stop", "stop please"}
+        ):
+            return "NOT_INTERESTED"
         if (
             "HUMAN_TRANSFER" in self.campaign.desired_outcomes
             and self._is_explicit_transfer_request(normalized_utterance)
@@ -51,8 +68,8 @@ class ConversationPolicy:
             return outcome
         return None
 
-    def direct_faq_answer(self, utterance: str) -> str | None:
-        normalized_utterance = _normalized(utterance).strip(".,!? ")
+    def direct_faq_response(self, utterance: str) -> DirectFaqResponse | None:
+        normalized_utterance = normalize_match_text(utterance)
         if re.search(
             r"\b(?:call me back|callback|do not call|don't call|"
             r"speak to (?:a )?(?:person|human|agent)|transfer me)\b",
@@ -60,10 +77,117 @@ class ConversationPolicy:
         ):
             return None
         for question, answer in self.campaign.faq_answers.items():
-            normalized_question = _normalized(question).strip(".,!? ")
-            if normalized_utterance == normalized_question:
-                return answer
+            accepted_questions = (
+                question,
+                *self.campaign.faq_aliases.get(question, ()),
+            )
+            if normalized_utterance in {
+                normalize_match_text(candidate)
+                for candidate in accepted_questions
+            }:
+                return DirectFaqResponse(
+                    answer=answer,
+                    resume_objective=question not in self.campaign.faq_answer_only,
+                )
         return None
+
+    def direct_faq_answer(self, utterance: str) -> str | None:
+        response = self.direct_faq_response(utterance)
+        return response.answer if response is not None else None
+
+    def contained_faq_response(self, utterance: str) -> DirectFaqResponse | None:
+        normalized_utterance = normalize_match_text(utterance)
+        matched_questions: list[str] = []
+        for question in self.campaign.faq_answers:
+            accepted_questions = (
+                question,
+                *self.campaign.faq_aliases.get(question, ()),
+            )
+            if any(
+                re.search(
+                    rf"(?:^|\s){re.escape(normalize_match_text(candidate))}(?:$|\s)",
+                    normalized_utterance,
+                )
+                for candidate in accepted_questions
+            ):
+                matched_questions.append(question)
+        unique_questions = tuple(dict.fromkeys(matched_questions))
+        if len(unique_questions) != 1:
+            return None
+        question = unique_questions[0]
+        return DirectFaqResponse(
+            answer=self.campaign.faq_answers[question],
+            resume_objective=question not in self.campaign.faq_answer_only,
+        )
+
+    @staticmethod
+    def is_hesitation_fragment(utterance: str) -> bool:
+        normalized = normalize_match_text(utterance)
+        if normalized in {
+            "ah",
+            "uh",
+            "um",
+            "hmm",
+            "so",
+            "well",
+            "this is",
+            "what i want to say",
+            "let me think",
+            "i am thinking",
+            "i'm thinking",
+        }:
+            return True
+        return re.fullmatch(
+            r"(?:ah|uh|um|hmm)(?:\s+(?:ah|uh|um|hmm|yeah|so|well|i|am|"
+            r"i'm|thinking|this|is)){0,7}",
+            normalized,
+        ) is not None
+
+    @staticmethod
+    def is_direct_question(utterance: str) -> bool:
+        normalized = normalize_match_text(utterance)
+        if "?" in utterance:
+            return True
+        return re.match(
+            r"^(?:please\s+)?(?:who|what|where|when|why|how|which|"
+            r"can|could|do|does|did|are|is|will|would|should)\b",
+            normalized,
+        ) is not None
+
+    def explicitly_skipped_field(
+        self,
+        state: ConversationState,
+        utterance: str,
+    ) -> str | None:
+        field_name = state.last_asked_field
+        if (
+            field_name is None
+            or field_name in self.campaign.required_fields
+            or not self.campaign.behavior.get("allow_secondary_field_skips", False)
+        ):
+            return None
+        normalized = _normalized(utterance)
+        normalized_match = normalize_match_text(utterance)
+        generic_skip = re.fullmatch(
+            r"(?:(?:i\s+)?(?:don't|do not)\s+know|not sure|no idea|"
+            r"(?:i\s+)?(?:would\s+)?rather not say|"
+            r"(?:i\s+)?prefer not to say)",
+            normalized_match,
+        )
+        field_specific_skip = False
+        if field_name in {"expected_price", "expected_rent"}:
+            field_specific_skip = re.search(
+                r"\bno\s+(?:specific\s+)?(?:range|figure|price|amount)\b|"
+                r"\b(?:don't|do not)\s+know\b.{0,30}"
+                r"\b(?:range|figure|price|amount)\b|"
+                r"\b(?:can|could)\s+you\s+(?:tell|give)\s+me\s+"
+                r"(?:the\s+)?(?:price\s+)?range\b|"
+                r"\b(?:not sure|don't know|do not know)\b.{0,40}"
+                r"\b(?:price|rent|amount|figure|ask|range|worth)\b|"
+                r"\bwhat\s+(?:price\s+)?(?:should|can|could)\s+i\s+ask\b",
+                normalized,
+            ) is not None
+        return field_name if generic_skip or field_specific_skip else None
 
     def apply_interpretation(
         self,
@@ -102,6 +226,7 @@ class ConversationPolicy:
             ):
                 if state.fields.get(name) != value:
                     state.fields[name] = value
+                    state.skipped_fields.discard(name)
                     changed = True
 
         if (
@@ -243,12 +368,20 @@ class ConversationPolicy:
 
         last_field = state.last_asked_field
         if last_field and self.campaign.field_types.get(last_field) == "boolean":
-            yes_answers = {"yes", "yes it is", "it is", "yeah", "yep"}
-            no_answers = {"no", "no it isn't", "it isn't", "not yet", "nope"}
-            if normalized_utterance in yes_answers:
-                updates[last_field] = True
-            elif normalized_utterance in no_answers:
+            boolean_answer = normalize_match_text(utterance)
+            boolean_answer = re.sub(
+                r"^(?:(?:ah|uh|um|hmm|well|okay|ok|so)\s+)+",
+                "",
+                boolean_answer,
+            )
+            if re.fullmatch(
+                r"(?:no|nope|not yet|no it isn't|no it is not|"
+                r"no not yet|nope not yet)",
+                boolean_answer,
+            ):
                 updates[last_field] = False
+            elif re.match(r"^(?:yes|yeah|yep)(?:\s+it is)?$", boolean_answer):
+                updates[last_field] = True
         if "currently_listed" in self.campaign.questions:
             if re.search(
                 r"\b(?:not listed|isn't listed|is not listed|"
@@ -321,6 +454,18 @@ class ConversationPolicy:
                 )
                 else None
             )
+        if suggested_outcome in {"WRONG_NUMBER", "NOT_INTERESTED"}:
+            return (
+                suggested_outcome
+                if any(
+                    self._contains_phrase(normalized_utterance, phrase)
+                    for phrase in self.campaign.hard_stop_phrases.get(
+                        suggested_outcome,
+                        (),
+                    )
+                )
+                else None
+            )
         explicit_property_outcome = self._explicit_property_outcome(
             normalized_utterance
         )
@@ -328,6 +473,8 @@ class ConversationPolicy:
             return explicit_property_outcome
         if suggested_outcome == state.outcome:
             return suggested_outcome
+        if suggested_outcome == "UNKNOWN" and state.outcome != "UNKNOWN":
+            return state.outcome
 
         property_outcomes = {"SELL", "RENT", "SELL_OR_RENT", "FUTURE"}
         if state.outcome in property_outcomes and suggested_outcome == "CALLBACK":
@@ -481,6 +628,37 @@ class ConversationPolicy:
         if safe_acknowledgement is None:
             return None
         normalized_acknowledgement = _normalized(safe_acknowledgement).strip(".,!? ")
+        lead_in_match = re.match(
+            r"^(okay|ok|got it|got you|right|sure|understood|alright|"
+            r"i see|makes sense|great|perfect|amazing|excellent|fantastic|"
+            r"wonderful)\b",
+            normalized_acknowledgement,
+        )
+        lead_in = lead_in_match.group(1) if lead_in_match else None
+        excessive_praise = {
+            "amazing",
+            "excellent",
+            "fantastic",
+            "great",
+            "perfect",
+            "wonderful",
+        }
+        if lead_in in excessive_praise:
+            return None
+        recent_lead_ins = {
+            match.group(1)
+            for turn in recent_dialogue[-8:]
+            if turn.get("role") == "agent"
+            if (
+                match := re.match(
+                    r"^(okay|ok|got it|got you|right|sure|understood|alright|"
+                    r"i see|makes sense)\b",
+                    _normalized(turn["text"]),
+                )
+            )
+        }
+        if lead_in is not None and lead_in in recent_lead_ins:
+            return None
         recent_openings = {
             _normalized(re.split(r"(?<=[.!?])\s+", turn["text"], maxsplit=1)[0])
             .strip(".,!? ")
@@ -488,9 +666,6 @@ class ConversationPolicy:
             if turn.get("role") == "agent"
         }
         if normalized_acknowledgement in recent_openings:
-            return None
-        excessive_praise = {"amazing", "excellent", "fantastic", "perfect", "wonderful"}
-        if normalized_acknowledgement in excessive_praise:
             return None
         return safe_acknowledgement
 
@@ -577,12 +752,49 @@ class ConversationPolicy:
                 "place",
                 "thing",
             },
+            "selling_timeline": {
+                "actively looking for the selling",
+                "actively looking to sell",
+                "looking to sell",
+                "thinking of selling",
+            },
+            "expected_price": {
+                "a good price",
+                "a very good price",
+                "good price",
+                "very good price",
+                "market price",
+            },
+            "expected_rent": {
+                "a good rent",
+                "good rent",
+                "market rent",
+            },
         }
         allowed_values = self.campaign.field_allowed_values.get(name)
         if name == "property_location" and re.search(
             r"\b(?:address|name|location|here|there)\b",
             normalized_value,
         ):
+            return False
+        if name in {"selling_timeline", "availability_date", "follow_up_date"}:
+            if re.search(
+                r"\b(?:now|soon|immediately|today|tomorrow|next|this|"
+                r"days?|weeks?|months?|years?|as soon as possible)\b",
+                normalized_value,
+            ) is None:
+                return False
+        if name in {"expected_price", "expected_rent"}:
+            if re.search(
+                r"\b(?:\d|one|two|three|four|five|six|seven|eight|nine|ten|"
+                r"hundred|thousand|million|aed|dirhams?)\b",
+                normalized_value,
+            ) is None:
+                return False
+        if name == "expected_price" and re.search(
+            r"\b(?:aed|dirhams?|million|thousand|[0-9]+(?:\.[0-9]+)?\s*[km])\b",
+            normalized_value,
+        ) is None:
             return False
         return (
             normalized_value not in generic_non_values

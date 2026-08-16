@@ -108,6 +108,54 @@ class QwenMlxConversationModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("contact-list FAQ", context)
         self.assertNotIn("owner becomes annoyed", context)
 
+    async def test_faq_alias_selects_approved_answer_for_mixed_turn(self) -> None:
+        backend = FakeBackend('{"suggested_outcome":null,"field_updates":{}}')
+        model = QwenMlxConversationModel(backend)
+
+        await model.interpret(
+            "Where did you get my name, and can I sell a flat?",
+            self.state,
+            self.campaign,
+        )
+
+        context = backend.messages[1]["content"]
+        self.assertIn("contact list provided for this test call", context)
+
+    def test_selects_realistic_property_scenario_guidance(self) -> None:
+        cases = (
+            (
+                "I'm already working with an agent.",
+                "Do not undermine or try to displace the other agent",
+            ),
+            (
+                "I'm busy, just WhatsApp me.",
+                "cannot send WhatsApp",
+            ),
+            (
+                "I want to rent it; my tenant leaves next month.",
+                "capture any volunteered availability and rent",
+            ),
+            (
+                "AED 3 million is my expected price.",
+                "Treat the amount as the owner's expectation, not a valuation",
+            ),
+        )
+
+        for utterance, expected_guidance in cases:
+            with self.subTest(utterance=utterance):
+                messages = QwenMlxConversationModel._build_messages(
+                    utterance,
+                    ConversationState(
+                        call_id="call-scenario",
+                        session_id="session-scenario",
+                        campaign_id=self.campaign.campaign_id,
+                        last_asked_field="intent",
+                    ),
+                    self.campaign,
+                )
+
+                self.assertIn(expected_guidance, messages[1]["content"])
+
     def test_prompt_budget_trims_oldest_dialogue_without_mutating_state(self) -> None:
         self.state.recent_dialogue = [
             {

@@ -94,6 +94,8 @@ class QwenSpeechAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.kwargs["voice"], "Ryan")
         self.assertEqual(model.kwargs["instruct"], "Warm and concise")
         self.assertTrue(model.kwargs["stream"])
+        self.assertEqual(model.kwargs["temperature"], 0.0)
+        self.assertEqual(model.kwargs["top_k"], 50)
 
     async def test_tts_uses_default_style_without_per_call_options(self) -> None:
         model = FakeTtsModel()
@@ -106,6 +108,20 @@ class QwenSpeechAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(frames)
         self.assertEqual(model.kwargs["instruct"], "Natural telephone delivery")
+
+    async def test_tts_sampling_profile_is_configurable(self) -> None:
+        model = FakeTtsModel()
+        synthesizer = QwenMlxSpeechSynthesizer(
+            model=model,
+            temperature=0.35,
+            top_k=20,
+        )
+
+        frames = [frame async for frame in synthesizer.synthesize("Hello")]
+
+        self.assertTrue(frames)
+        self.assertEqual(model.kwargs["temperature"], 0.35)
+        self.assertEqual(model.kwargs["top_k"], 20)
 
 
 if __name__ == "__main__":

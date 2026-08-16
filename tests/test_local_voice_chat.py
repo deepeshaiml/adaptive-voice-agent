@@ -1,14 +1,18 @@
 from array import array
 import asyncio
+from pathlib import Path
 import time
 import unittest
 
 from speaking_agent.domain import AgentReply
 from speaking_agent.delivery import campaign_voice_style
 from speaking_agent.local_voice_chat import (
+    _audio_recorder,
     _check_audio_settings,
+    _conversation_context,
     _device,
     _record_utterance,
+    _recording_error,
     _speak,
     _wait_for_room_echo,
     parse_args,
@@ -166,6 +170,78 @@ class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
         defaults = parse_args(["--full-duplex"])
         self.assertEqual(defaults.barge_in_energy_threshold, 0.03)
         self.assertEqual(defaults.echo_gain, 1.0)
+        self.assertEqual(defaults.tts_temperature, 0.0)
+        self.assertEqual(defaults.tts_top_k, 50)
+
+    def test_demo_and_explicit_metadata_build_in_memory_context(self) -> None:
+        demo = _conversation_context(parse_args(["--demo-metadata"]))
+
+        self.assertEqual(demo.recipient_name, "Mr. Ahmed")
+        self.assertIn("Marina Gate", demo.property_reference)
+        self.assertEqual(demo.known_fields["property_location"], "Dubai Marina")
+
+        explicit = _conversation_context(
+            parse_args(
+                [
+                    "--recipient-name",
+                    "Ms. Fatima",
+                    "--property-reference",
+                    "your villa in Dubai Hills",
+                    "--property-location",
+                    "Dubai Hills Estate",
+                    "--property-type",
+                    "villa",
+                ]
+            )
+        )
+
+        self.assertEqual(explicit.recipient_name, "Ms. Fatima")
+        self.assertEqual(explicit.known_fields["property_type"], "villa")
+
+        with self.assertRaises(SystemExit):
+            parse_args(["--recipient-name", "Mr. Ahmed"])
+        with self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--demo-metadata",
+                    "--recipient-name",
+                    "Mr. Ahmed",
+                    "--property-reference",
+                    "Marina Gate",
+                ]
+            )
+
+    def test_audio_recording_requires_full_duplex_and_consent_reference(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args(["--record-audio", "--recording-consent-reference", "self-test"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--full-duplex", "--record-audio"])
+
+        args = parse_args(
+            [
+                "--full-duplex",
+                "--record-audio",
+                "--recording-consent-reference",
+                "self-test",
+                "--recording-directory",
+                "output/recordings",
+            ]
+        )
+        recorder = _audio_recorder(args)
+
+        self.assertIsNotNone(recorder)
+        self.assertEqual(recorder.consent.reference, "self-test")
+        self.assertEqual(recorder.root_directory, Path("output/recordings"))
+
+        class Result:
+            cleanup_errors = ("audio_recorder:TimeoutError",)
+
+        self.assertIn("TimeoutError", _recording_error(Result(), recorder))
+
+        class CleanResult:
+            cleanup_errors = ()
+
+        self.assertIn("no audio artifact", _recording_error(CleanResult(), recorder))
 
     def test_audio_settings_use_defaults_when_devices_are_omitted(self) -> None:
         audio = FakeAudio()

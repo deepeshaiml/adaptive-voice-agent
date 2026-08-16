@@ -31,7 +31,13 @@ class QwenMlxSpeechSynthesizer:
         streaming_interval_seconds: float = 0.32,
         frame_duration_ms: int = 20,
         cancellation_grace_seconds: float = 2.0,
+        temperature: float = 0.0,
+        top_k: int = 50,
     ) -> None:
+        if not 0 <= temperature <= 2:
+            raise ValueError("TTS temperature must be between 0 and 2")
+        if top_k < 0:
+            raise ValueError("TTS top_k cannot be negative")
         self.model_path = model_path
         self._model = model
         self.default_voice = default_voice
@@ -40,6 +46,8 @@ class QwenMlxSpeechSynthesizer:
         self.streaming_interval_seconds = streaming_interval_seconds
         self.frame_duration_ms = frame_duration_ms
         self._cancellation_grace_seconds = cancellation_grace_seconds
+        self.temperature = temperature
+        self.top_k = top_k
         self._cancellation = Event()
         self._operation_lock = asyncio.Lock()
         self._unhealthy = False
@@ -91,6 +99,8 @@ class QwenMlxSpeechSynthesizer:
                         lang_code=options.language or self.default_language,
                         stream=True,
                         streaming_interval=self.streaming_interval_seconds,
+                        temperature=self.temperature,
+                        top_k=self.top_k,
                         verbose=False,
                     ),
                     self._cancellation,

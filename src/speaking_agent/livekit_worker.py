@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from livekit.agents import AgentServer, AutoSubscribe, JobContext, cli
 
+from speaking_agent.audio_recording import RecordingConsent, WaveConversationRecorder
 from speaking_agent.adapters.asr.qwen_mlx import QwenMlxSpeechRecognizer
 from speaking_agent.adapters.llm.qwen_mlx import MlxLmBackend, QwenMlxConversationModel
 from speaking_agent.adapters.storage.sqlite import SQLiteCallRepository
@@ -17,6 +18,7 @@ from speaking_agent.adapters.tts.qwen_mlx import QwenMlxSpeechSynthesizer
 from speaking_agent.answering import HeuristicAnsweringMachineDetector
 from speaking_agent.campaign import load_campaign
 from speaking_agent.delivery import campaign_voice_style
+from speaking_agent.domain import ConversationContext
 from speaking_agent.outbound import (
     DialStatus,
     LiveKitSipDialer,
@@ -49,7 +51,22 @@ async def entrypoint(context: JobContext) -> None:
     )
 
     metadata = json.loads(context.job.metadata or "{}")
+    if not isinstance(metadata, dict):
+        raise ValueError("LiveKit job metadata must be an object")
     phone_number = metadata.get("phone_number")
+    raw_conversation_context = metadata.get("conversation_context", {})
+    if not isinstance(raw_conversation_context, dict) or set(
+        raw_conversation_context
+    ) - {"recipient_name", "property_reference", "known_fields"}:
+        raise ValueError("LiveKit conversation context is invalid")
+    known_fields = raw_conversation_context.get("known_fields", {})
+    if not isinstance(known_fields, dict):
+        raise ValueError("LiveKit conversation context known_fields must be an object")
+    conversation_context = ConversationContext(
+        recipient_name=raw_conversation_context.get("recipient_name"),
+        property_reference=raw_conversation_context.get("property_reference"),
+        known_fields=known_fields,
+    )
     participant_identity = (
         f"controlled-callee-{uuid4().hex[:12]}" if phone_number else None
     )
@@ -118,6 +135,30 @@ async def entrypoint(context: JobContext) -> None:
         transfer_handler=transfer if transfer_to else None,
     )
     campaign = load_campaign(campaign_path)
+    audio_recorder = None
+    recording_error: PermissionError | None = None
+    if campaign.behavior["recording_enabled"]:
+        consent_reference = metadata.get("recording_consent_reference")
+        if not isinstance(consent_reference, str):
+            recording_error = PermissionError(
+                "Recording requires a per-call consent reference"
+            )
+        else:
+            try:
+                consent = RecordingConsent(consent_reference)
+            except ValueError as error:
+                recording_error = PermissionError(
+                    "Recording consent reference is invalid"
+                )
+                recording_error.__cause__ = error
+            else:
+                audio_recorder = WaveConversationRecorder(
+                    os.environ.get(
+                        "SPEAKING_AGENT_RECORDING_DIRECTORY",
+                        "data/recordings",
+                    ),
+                    consent,
+                )
     session = CallSession(
         campaign=campaign,
         model=QwenMlxConversationModel(MlxLmBackend()),
@@ -133,6 +174,8 @@ async def entrypoint(context: JobContext) -> None:
         recognition_language="English",
         recognition_context=campaign.speech_recognition_context,
         transfer_available=bool(transfer_to),
+        conversation_context=conversation_context,
+        audio_recorder=audio_recorder,
     )
     legacy_retention = os.environ.get("SPEAKING_AGENT_LEGACY_RETENTION_DAYS")
     repository = SQLiteCallRepository(
@@ -162,14 +205,14 @@ async def entrypoint(context: JobContext) -> None:
             await repository.close()
             context.shutdown("campaign disabled")
         return
-    if campaign.behavior["recording_enabled"]:
+    if recording_error is not None:
         session.conversation.abort()
         try:
             await repository.save(
                 failed_call_record(
                     session,
-                    RuntimeError("Recording is configured but not implemented"),
-                    connection_result="BLOCKED_RECORDING_UNAVAILABLE",
+                    recording_error,
+                    connection_result="BLOCKED_RECORDING_CONSENT_REQUIRED",
                     duration_seconds=0.0,
                     phone_number_masked=(
                         mask_phone_number(phone_number) if phone_number else None
@@ -178,7 +221,7 @@ async def entrypoint(context: JobContext) -> None:
             )
         finally:
             await repository.close()
-            context.shutdown("recording unavailable")
+            context.shutdown("recording consent required")
         return
     if phone_number is not None:
         suppression = ContactSuppressionService(

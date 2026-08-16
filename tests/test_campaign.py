@@ -26,6 +26,15 @@ class CampaignTests(unittest.TestCase):
             campaign.field_extraction_hints["property_location"],
         )
         self.assertIn("Dubai", campaign.conversation_brief)
+        self.assertIn(
+            "where did you get my name",
+            campaign.faq_aliases["how did you get my number"],
+        )
+        self.assertIn("who are you", campaign.faq_answer_only)
+        self.assertIn(
+            "{recipient_name}",
+            campaign.personalized_preamble["recipient_confirmation"],
+        )
         self.assertGreaterEqual(len(campaign.scenario_playbook), 1)
         self.assertEqual(campaign.voice_style["personality"].split(",")[0], "Warm")
         self.assertGreaterEqual(len(campaign.natural_conversation_rules), 1)
@@ -275,6 +284,70 @@ class CampaignTests(unittest.TestCase):
                         {
                             **campaign.__dict__,
                             "faq_answers": {"are you human": unsafe_answer},
+                            "faq_aliases": {},
+                            "faq_answer_only": (),
+                        }
+                    )
+
+    def test_rejects_invalid_or_overlapping_faq_aliases(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+        invalid_aliases = (
+            ["not", "an", "object"],
+            {"unknown question": ["alias"]},
+            {"how did you get my number": []},
+            {"how did you get my number": [""]},
+            {
+                "how did you get my number": ["shared alias"],
+                "why are you calling me": ["shared alias"],
+            },
+        )
+
+        for faq_aliases in invalid_aliases:
+            with self.subTest(faq_aliases=faq_aliases):
+                with self.assertRaisesRegex(ValueError, "FAQ aliases"):
+                    type(campaign).from_dict(
+                        {**campaign.__dict__, "faq_aliases": faq_aliases}
+                    )
+
+    def test_rejects_invalid_answer_only_faq_references(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+        invalid_values = (
+            "who are you",
+            [""],
+            ["unknown question"],
+            ["who are you", "who are you"],
+        )
+
+        for faq_answer_only in invalid_values:
+            with self.subTest(faq_answer_only=faq_answer_only):
+                with self.assertRaisesRegex(ValueError, "faq_answer_only"):
+                    type(campaign).from_dict(
+                        {
+                            **campaign.__dict__,
+                            "faq_answer_only": faq_answer_only,
+                        }
+                    )
+
+    def test_rejects_invalid_personalized_preamble(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+        valid = campaign.personalized_preamble
+        invalid_values = (
+            {"recipient_confirmation": "Missing other templates?"},
+            {**valid, "recipient_confirmation": "Am I speaking with {name}?"},
+            {**valid, "property_timing": "Calling about {property_reference}."},
+            {
+                **valid,
+                "recipient_confirmation": "Am I speaking with {recipient_name}?",
+            },
+        )
+
+        for personalized_preamble in invalid_values:
+            with self.subTest(personalized_preamble=personalized_preamble):
+                with self.assertRaisesRegex(ValueError, "personalized"):
+                    type(campaign).from_dict(
+                        {
+                            **campaign.__dict__,
+                            "personalized_preamble": personalized_preamble,
                         }
                     )
 
@@ -304,7 +377,11 @@ class CampaignTests(unittest.TestCase):
             "voicemail": {
                 "voicemail_message": f"{campaign.introduction} {unsafe}"
             },
-            "faq": {"faq_answers": {"are you human": unsafe}},
+            "faq": {
+                "faq_answers": {"are you human": unsafe},
+                "faq_aliases": {},
+                "faq_answer_only": (),
+            },
             "model_error": {
                 "behavior": {**campaign.behavior, "model_error_message": unsafe}
             },

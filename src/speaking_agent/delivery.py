@@ -5,7 +5,8 @@ from speaking_agent.campaign import Campaign
 
 DEFAULT_VOICE_STYLE = (
     "Speak warmly and naturally with conversational pacing, subtle pauses, and no "
-    "announcer tone. Keep the delivery calm and concise."
+    "announcer tone. Keep the delivery calm and concise. Maintain exactly the same "
+    "speaker identity, accent, pitch range, pace, and energy on every turn."
 )
 
 
@@ -27,4 +28,8 @@ def campaign_voice_style(campaign: Campaign) -> str:
     avoid = style.get("avoid")
     if isinstance(avoid, (list, tuple)) and avoid:
         parts.append("Avoid " + ", ".join(str(value) for value in avoid[:6]) + ".")
+    parts.append(
+        "Maintain exactly the same speaker identity, accent, pitch range, pace, "
+        "and restrained energy on every turn."
+    )
     return " ".join(parts) or DEFAULT_VOICE_STYLE

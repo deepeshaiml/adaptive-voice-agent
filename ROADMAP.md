@@ -8,7 +8,7 @@ Checklist meaning:
 - `[ ]` is incomplete; partial foundations are described explicitly and must not be
       interpreted as platform support.
 
-Current validation baseline: **161 unit/scenario/adapter tests**, clean `pip check`,
+Current validation baseline: **214 unit/scenario/adapter tests**, clean `pip check`,
 clean bytecode compilation, clean `git diff --check`, resolved local Markdown links,
 and no editor diagnostics. A single warm local Qwen planning smoke completed in 1.214
 seconds. That number is useful as a regression signal only; repeatable P50/P95
@@ -138,6 +138,23 @@ Keep application protocols unchanged and select adapters through one composition
       evidence, including cue-local corrections and punctuation-free sell/rent pivots.
 - [x] Select relevant campaign guidance, scenarios, FAQs, voice style, opening variants,
       and ASR vocabulary without passing the complete campaign on every turn.
+- [x] Route configured standalone FAQ/ASR paraphrases through approved answers while
+      preserving model handling for mixed FAQ-and-intent turns.
+- [x] Allow approved identity clarifications and repetition complaints to pause
+      qualification instead of immediately appending another field question.
+- [x] Stabilize Qwen TTS with a greedy default and fixed cross-turn identity/style
+      instruction while retaining explicit sampling controls for experiments.
+- [x] Keep hesitation fragments from consuming retry budget, scope retries to the pending
+      field, accept filler-prefixed booleans, and stop repeated unknown-price/listing loops.
+- [x] Cover common property-owner scenarios with conditional guidance and safe approved
+      responses without inventing buyer, WhatsApp, transaction, or valuation tools.
+- [x] Support validated in-memory recipient/property metadata with an optional disclosed
+      recipient-confirmation, timing-permission, and qualification preamble; preserve the
+      generic opening when metadata is absent.
+- [x] Add explicit consent-gated dual-channel WAV capture with owner-only artifacts,
+      transport-confirmed agent playout, integrity manifests, and retention purge.
+- [ ] Add application-level encryption, de-identification, role-based review access,
+      annotation/versioning, and an approved training-data export/deletion workflow.
 - [x] Enforce permanent DNC, temporary callback, transfer, disclosure, and prohibited
       identity rules outside the model, with campaign-load and runtime defenses.
 - [ ] Move property-specific deterministic extraction/grounding behind a declarative or
@@ -167,8 +184,9 @@ Work in this order unless measured evidence changes the priority.
 | 5 | Linux NVIDIA backend evaluation | New adapters under `adapters/llm/`, `adapters/asr/`, and `adapters/tts/`; keep `model.py`, `speech.py`, and `transport.py` unchanged | Verify current upstream MLX support first; benchmark it only if supported, then compare native CUDA/portable alternatives independently for LLM, ASR, and TTS | After profiles and benchmark tooling exist on native Linux NVIDIA hardware | Clean install, full tests, real speech round trips, LiveKit audio, explicit GPU use, and published latency/memory results pass |
 | 6 | Portable CPU/Linux/Windows profiles | Same adapter boundaries plus CI and constraints/lock files | Add portable implementations one workload at a time; never report support from wheel availability alone | After the Linux NVIDIA composition path proves replaceability | Native matrix in validation order passes all applicable support criteria |
 | 7 | Domain-policy boundary | `campaign.py`, `policy.py`, `conversation.py`, and domain-specific tests | Define application-owned deterministic extractors/validators selected explicitly by campaign type; keep shared DNC/disclosure/transfer policy central | Before the first materially non-property campaign | Existing property scenarios remain green and a second domain works without property branches in shared policy |
-| 8 | Conversation quality benchmark | `tests/test_conversation.py`, a new consented scenario corpus outside persisted call records, and benchmark reporting | Score task completion, correction handling, grounded extraction, repetition, hallucination, latency, and interruption recovery | Before changing model size, prompt strategy, or adding backchannels | Baseline and candidate runs are reproducible and regressions have explicit thresholds |
-| 9 | Natural delivery improvements | `delivery.py`, TTS adapters, `conversation.py`, and `voice_session.py` | Add measured prosody/backchannel timing and safe sentence-level streaming without allowing unvalidated text to reach TTS | After quality and latency benchmarks can detect regressions | First-audio latency improves while safety, interruption, and repetition suites remain green |
+| 8 | Recording governance and training-data pipeline | `audio_recording.py`, retention/operator tooling, deployment secrets/storage, and new dataset tooling | Encrypt recordings, de-identify where feasible, require role-based review, preserve consent/provenance/deletion lineage, and export only approved examples | Before any recording is used outside controlled quality review or for model training | Security/compliance review passes and every exported item has consent, provenance, labels, version, retention, and deletion handling |
+| 9 | Conversation quality benchmark | `tests/test_conversation.py`, a new consented scenario corpus outside persisted call records, and benchmark reporting | Score task completion, correction handling, grounded extraction, repetition, hallucination, latency, and interruption recovery | Before changing model size, prompt strategy, or adding backchannels | Baseline and candidate runs are reproducible and regressions have explicit thresholds |
+| 10 | Natural delivery improvements | `delivery.py`, TTS adapters, `conversation.py`, and `voice_session.py` | Add measured prosody/backchannel timing and safe sentence-level streaming without allowing unvalidated text to reach TTS | After quality and latency benchmarks can detect regressions | First-audio latency improves while safety, interruption, and repetition suites remain green |
 
 ## Change and Update Rules
 

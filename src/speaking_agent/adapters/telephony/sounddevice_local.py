@@ -219,6 +219,33 @@ class SoundDeviceCallTransport:
         self._closing = False
         self.last_input_status: str | None = None
         self.last_output_status: str | None = None
+        self._playout_observer: Callable[[AudioFrame, float], None] | None = None
+        self._playout_observer_error: BaseException | None = None
+
+    def set_playout_observer(
+        self,
+        observer: Callable[[AudioFrame, float], None] | None,
+    ) -> None:
+        self._playout_observer = observer
+
+    def _notify_playout_observer(
+        self,
+        frame: AudioFrame,
+        started_at: float,
+    ) -> None:
+        if self._playout_observer is None:
+            return
+        try:
+            self._playout_observer(frame, started_at)
+        except BaseException as error:
+            self._playout_observer_error = error
+
+    def _raise_playout_observer_error(self) -> None:
+        error = self._playout_observer_error
+        if error is None:
+            return
+        self._playout_observer_error = None
+        raise TransportError("Full-duplex playout recording failed") from error
 
     async def prepare(self) -> None:
         try:
@@ -320,12 +347,17 @@ class SoundDeviceCallTransport:
         payload = played + bytes(required_bytes - byte_count)
         memoryview(output_data).cast("B")[:required_bytes] = payload
         if played:
-            self.echo_suppressor.add_output(
-                AudioFrame(
-                    data=played,
-                    format=PcmFormat(self.config.output_sample_rate_hz),
-                )
+            played_frame = AudioFrame(
+                data=played,
+                format=PcmFormat(self.config.output_sample_rate_hz),
             )
+            self.echo_suppressor.add_output(played_frame)
+            if self._playout_observer is not None and self._loop is not None:
+                self._loop.call_soon_threadsafe(
+                    self._notify_playout_observer,
+                    played_frame,
+                    time.monotonic(),
+                )
         if drained and self._loop is not None and self._playout_drained is not None:
             self._loop.call_soon_threadsafe(self._mark_playout_drained_if_empty)
 
@@ -369,6 +401,7 @@ class SoundDeviceCallTransport:
             latency = getattr(output_stream, "latency", 0.0)
             if isinstance(latency, (int, float)) and latency > 0:
                 await asyncio.sleep(float(latency))
+            self._raise_playout_observer_error()
         self.echo_suppressor.finish_playback()
 
     async def stop_audio(self) -> None:
@@ -380,6 +413,7 @@ class SoundDeviceCallTransport:
         if output_stream is not None and hasattr(output_stream, "abort"):
             await asyncio.to_thread(output_stream.abort)
             await asyncio.to_thread(output_stream.start)
+        self._raise_playout_observer_error()
         self.echo_suppressor.finish_playback()
 
     async def hang_up(self) -> None:

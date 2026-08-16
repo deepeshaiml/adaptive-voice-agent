@@ -11,6 +11,10 @@ def normalize_text(text: str) -> str:
     return " ".join(canonical.casefold().split())
 
 
+def normalize_match_text(text: str) -> str:
+    return " ".join(re.sub(r"[^\w']+", " ", normalize_text(text)).split())
+
+
 def claims_human_identity(text: str) -> bool:
     normalized = normalize_text(text)
     identity = (

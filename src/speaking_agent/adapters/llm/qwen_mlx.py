@@ -352,7 +352,17 @@ class QwenMlxConversationModel:
         scored = sorted(
             (
                 (
-                    len(query_tokens & cls._keywords(question)),
+                    len(
+                        query_tokens
+                        & cls._keywords(
+                            " ".join(
+                                (
+                                    question,
+                                    *campaign.faq_aliases.get(question, ()),
+                                )
+                            )
+                        )
+                    ),
                     -index,
                     question,
                     answer,

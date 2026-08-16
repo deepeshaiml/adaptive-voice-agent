@@ -4,6 +4,7 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from speaking_agent.answering import AnswerKind
+from speaking_agent.call_cli import _dispatch_metadata, parse_args
 from speaking_agent.outbound import (
     DialStatus,
     LiveKitSipDialer,
@@ -52,6 +53,53 @@ def dial_request(phone_number: str = "+15105550123") -> OutboundDialRequest:
 
 
 class OutboundDialerTests(unittest.IsolatedAsyncioTestCase):
+    def test_controlled_call_metadata_carries_personalization_without_phone_leak(self) -> None:
+        args = parse_args(
+            [
+                "+15105550123",
+                "--recipient-name",
+                "Mr. Ahmed",
+                "--property-reference",
+                "your apartment in Marina Gate",
+                "--property-location",
+                "Dubai Marina",
+                "--property-type",
+                "apartment",
+                "--recording-consent-reference",
+                "consent-ticket-42",
+            ]
+        )
+
+        metadata = _dispatch_metadata(args)
+
+        self.assertEqual(metadata["phone_number"], "+15105550123")
+        context = metadata["conversation_context"]
+        self.assertEqual(context["recipient_name"], "Mr. Ahmed")
+        self.assertEqual(context["known_fields"]["property_type"], "apartment")
+        self.assertEqual(
+            metadata["recording_consent_reference"],
+            "consent-ticket-42",
+        )
+
+        fields_only = _dispatch_metadata(
+            parse_args(
+                [
+                    "+15105550123",
+                    "--property-location",
+                    "Dubai Marina",
+                    "--property-type",
+                    "apartment",
+                ]
+            )
+        )
+        self.assertEqual(
+            fields_only["conversation_context"]["known_fields"],
+            {
+                "property_location": "Dubai Marina",
+                "property_type": "apartment",
+            },
+        )
+
     async def test_connected_dial_uses_bounded_waiting_request(self) -> None:
         service = FakeSipService()
         sip_dialer = dialer(service)

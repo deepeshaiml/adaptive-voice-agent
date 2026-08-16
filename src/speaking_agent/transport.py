@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Callable, Protocol
 
 from speaking_agent.speech import AudioFrame
 
@@ -25,7 +25,15 @@ class TransportEvent:
     reason: str | None = None
 
 
+PlayoutObserver = Callable[[AudioFrame, float], None]
+
+
 class CallTransport(Protocol):
+    def set_playout_observer(
+        self,
+        observer: PlayoutObserver | None,
+    ) -> None: ...
+
     async def prepare(self) -> None: ...
 
     async def connect(self) -> None: ...

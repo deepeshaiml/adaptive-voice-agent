@@ -9,6 +9,7 @@ from speaking_agent.adapters.telephony.mock import MockCallTransport
 from speaking_agent.adapters.tts.mock import MockSpeechSynthesizer
 from speaking_agent.answering import AnswerKind, HeuristicAnsweringMachineDetector
 from speaking_agent.campaign import load_campaign
+from speaking_agent.domain import ConversationContext
 from speaking_agent.mock_model import MockConversationModel
 from speaking_agent.model import ModelInterpretation
 from speaking_agent.observability import TimingEventName
@@ -26,7 +27,106 @@ def audio_frame(amplitude: int) -> AudioFrame:
     return AudioFrame(data=samples.tobytes(), format=PcmFormat(16_000))
 
 
+class RecorderProbe:
+    def __init__(self) -> None:
+        self.artifact = None
+        self.prepared: tuple[str, str, int] | None = None
+        self.owner_frames: list[AudioFrame] = []
+        self.agent_frames: list[AudioFrame] = []
+        self.interruptions = 0
+        self.closed = False
+
+    async def prepare(self, *, call_id, campaign_id, retention_days) -> None:
+        self.prepared = (call_id, campaign_id, retention_days)
+
+    def record_owner_audio(self, frame) -> None:
+        self.owner_frames.append(frame)
+
+    def record_agent_audio(self, frame, started_at_monotonic=None) -> None:
+        del started_at_monotonic
+        self.agent_frames.append(frame)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
+    def test_recording_disabled_accepts_legacy_transport_without_observer(self) -> None:
+        class LegacyTransport:
+            pass
+
+        session = CallSession(
+            campaign=load_campaign(CAMPAIGN_PATH),
+            model=MockConversationModel(),
+            recognizer=MockSpeechRecognizer([]),
+            synthesizer=MockSpeechSynthesizer(),
+            transport=LegacyTransport(),
+        )
+
+        self.assertIsNone(session.audio_recorder)
+
+        with self.assertRaisesRegex(TypeError, "playout observation"):
+            CallSession(
+                campaign=load_campaign(CAMPAIGN_PATH),
+                model=MockConversationModel(),
+                recognizer=MockSpeechRecognizer([]),
+                synthesizer=MockSpeechSynthesizer(),
+                transport=LegacyTransport(),
+                audio_recorder=RecorderProbe(),
+            )
+
+    async def test_call_session_records_both_audio_channels_and_closes(self) -> None:
+        campaign = load_campaign(CAMPAIGN_PATH)
+        recorder = RecorderProbe()
+        transport = MockCallTransport()
+        session = CallSession(
+            campaign=campaign,
+            model=MockConversationModel(),
+            recognizer=MockSpeechRecognizer(
+                [TranscriptEvent(text="not interested", is_final=True)]
+            ),
+            synthesizer=MockSpeechSynthesizer(),
+            transport=transport,
+            audio_recorder=recorder,
+            turn_detector=EnergyTurnDetector(
+                TurnDetectionConfig(
+                    energy_threshold=0.02,
+                    minimum_speech_ms=60,
+                    end_silence_ms=60,
+                )
+            ),
+        )
+
+        run_task = asyncio.create_task(session.run())
+        await transport.first_audio_sent.wait()
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        result = await run_task
+
+        self.assertEqual(result.lead.outcome, "NOT_INTERESTED")
+        self.assertEqual(recorder.prepared[1:], (campaign.campaign_id, 30))
+        self.assertEqual(len(recorder.owner_frames), 7)
+        self.assertGreater(len(recorder.agent_frames), 0)
+        self.assertTrue(recorder.closed)
+
+    def test_call_session_forwards_personalized_context(self) -> None:
+        session = CallSession(
+            campaign=load_campaign(CAMPAIGN_PATH),
+            model=MockConversationModel(),
+            recognizer=MockSpeechRecognizer([]),
+            synthesizer=MockSpeechSynthesizer(),
+            transport=MockCallTransport(),
+            conversation_context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+        )
+
+        opening = session.conversation.start()
+
+        self.assertIn("Mr. Ahmed", opening.text)
+        self.assertIn("automated assistant", opening.text)
+
     async def test_empty_asr_turn_is_ignored_and_listening_continues(self) -> None:
         class SequencedRecognizer:
             def __init__(self) -> None:
@@ -234,6 +334,7 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirmed_barge_in_stops_audio_and_completes_hard_stop(self) -> None:
         interruptions: list[str] = []
+        recorder = RecorderProbe()
         transport = MockCallTransport()
         session = CallSession(
             campaign=load_campaign(CAMPAIGN_PATH),
@@ -244,6 +345,7 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
             synthesizer=MockSpeechSynthesizer(),
             transport=transport,
             on_interruption=lambda: interruptions.append("detected"),
+            audio_recorder=recorder,
             turn_detector=EnergyTurnDetector(
                 TurnDetectionConfig(
                     energy_threshold=0.02,
@@ -264,6 +366,7 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.answer_kind, AnswerKind.HUMAN)
         self.assertEqual(result.interruptions, 1)
         self.assertEqual(interruptions, ["detected"])
+        self.assertGreater(len(recorder.agent_frames), 0)
         agent_turns = [
             turn
             for turn in session.conversation.state.recent_dialogue
@@ -567,6 +670,89 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.lead.outcome, "SELL")
         self.assertEqual(result.lead.fields["property_type"], "apartment")
         self.assertEqual(result.lead.fields["selling_timeline"], "in two months")
+
+    async def test_personalized_outbound_confirms_recipient_after_human_detection(self) -> None:
+        class QueuedAffirmativeRecognizer:
+            def __init__(self) -> None:
+                self.responses = iter(("Yes?", "Yes?", "This is Ali"))
+                self.first_started = asyncio.Event()
+                self.release_first = asyncio.Event()
+                self.calls = 0
+
+            async def prepare(self):
+                return None
+
+            async def close(self):
+                return None
+
+            async def cancel(self):
+                self.release_first.set()
+
+            async def transcribe(self, audio, **kwargs):
+                del kwargs
+                async for _ in audio:
+                    pass
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_started.set()
+                    await self.release_first.wait()
+                yield TranscriptEvent(text=next(self.responses), is_final=True)
+
+        class RecordingSynthesizer(MockSpeechSynthesizer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.texts: list[str] = []
+
+            async def synthesize(self, text, **kwargs):
+                self.texts.append(text)
+                async for frame in super().synthesize(text, **kwargs):
+                    yield frame
+
+        transport = MockCallTransport()
+        synthesizer = RecordingSynthesizer()
+        recognizer = QueuedAffirmativeRecognizer()
+        session = CallSession(
+            campaign=load_campaign(CAMPAIGN_PATH),
+            model=MockConversationModel(),
+            recognizer=recognizer,
+            synthesizer=synthesizer,
+            transport=transport,
+            answering_detector=HeuristicAnsweringMachineDetector(),
+            conversation_context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+            turn_detector=EnergyTurnDetector(
+                TurnDetectionConfig(
+                    energy_threshold=0.02,
+                    minimum_speech_ms=60,
+                    end_silence_ms=60,
+                )
+            ),
+        )
+
+        run_task = asyncio.create_task(session.run())
+        await transport.connected_event.wait()
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        await recognizer.first_started.wait()
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        while not session._pending_turns:
+            await asyncio.sleep(0)
+        recognizer.release_first.set()
+        while transport.playout_wait_count < 1:
+            await asyncio.sleep(0)
+
+        self.assertIn("Mr. Ahmed", synthesizer.texts[0])
+        self.assertNotIn("Marina Gate", synthesizer.texts[0])
+
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        result = await run_task
+
+        self.assertEqual(result.lead.outcome, "WRONG_NUMBER")
+        self.assertTrue(all("Marina Gate" not in text for text in synthesizer.texts))
 
     async def test_second_outbound_human_turn_is_processed_without_reintroducing(self) -> None:
         class SequencedRecognizer:
@@ -1068,6 +1254,44 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.lead.outcome, "NOT_INTERESTED")
         self.assertIn("synthesizer:TimeoutError", result.cleanup_errors)
+
+    async def test_hanging_recorder_finalization_is_bounded_and_reported(self) -> None:
+        class HangingRecorder(RecorderProbe):
+            async def close(self) -> None:
+                await asyncio.Event().wait()
+
+        campaign = load_campaign(CAMPAIGN_PATH)
+        campaign = replace(
+            campaign,
+            behavior={**campaign.behavior, "cleanup_timeout_seconds": 0.01},
+        )
+        transport = MockCallTransport()
+        session = CallSession(
+            campaign=campaign,
+            model=MockConversationModel(),
+            recognizer=MockSpeechRecognizer(
+                [TranscriptEvent(text="not interested", is_final=True)]
+            ),
+            synthesizer=MockSpeechSynthesizer(),
+            transport=transport,
+            audio_recorder=HangingRecorder(),
+            turn_detector=EnergyTurnDetector(
+                TurnDetectionConfig(
+                    energy_threshold=0.02,
+                    minimum_speech_ms=60,
+                    end_silence_ms=60,
+                )
+            ),
+        )
+
+        run_task = asyncio.create_task(session.run())
+        await transport.first_audio_sent.wait()
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        result = await asyncio.wait_for(run_task, timeout=0.2)
+
+        self.assertEqual(result.lead.outcome, "NOT_INTERESTED")
+        self.assertIn("audio_recorder:TimeoutError", result.cleanup_errors)
 
     async def test_unavailable_transfer_falls_back_to_hangup(self) -> None:
         transport = MockCallTransport()

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from speaking_agent.adapters.storage.sqlite import SQLiteCallRepository
+from speaking_agent.audio_recording import purge_expired_recordings
 
 
 def _positive_seconds(value: str) -> float:
@@ -25,7 +26,18 @@ async def run(args: argparse.Namespace) -> int:
     try:
         while True:
             purged_rows = await repository.purge_expired()
-            print(json.dumps({"purged_rows": purged_rows}), flush=True)
+            purged_recordings = purge_expired_recordings(
+                args.recording_directory
+            )
+            print(
+                json.dumps(
+                    {
+                        "purged_rows": purged_rows,
+                        "purged_recordings": purged_recordings,
+                    }
+                ),
+                flush=True,
+            )
             if args.once:
                 return 0
             await asyncio.sleep(args.interval_seconds)
@@ -48,6 +60,11 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         default=3_600.0,
     )
     parser.add_argument("--legacy-retention-days", type=int)
+    parser.add_argument(
+        "--recording-directory",
+        type=Path,
+        default=Path("data/recordings"),
+    )
     parser.add_argument("--once", action="store_true")
     return parser.parse_args(arguments)
 

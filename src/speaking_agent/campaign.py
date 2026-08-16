@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from string import Formatter
 from pathlib import Path
 import re
 from typing import Any
 
-from speaking_agent.text_safety import claims_human_identity, normalize_text
+from speaking_agent.text_safety import (
+    claims_human_identity,
+    normalize_match_text,
+    normalize_text,
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +36,7 @@ class Campaign:
     transfer_unavailable_message: str
     question_variants: dict[str, tuple[str, ...]] = field(default_factory=dict)
     opening_variants: tuple[str, ...] = ()
+    personalized_preamble: dict[str, str] = field(default_factory=dict)
     conversation_brief: str = ""
     conversation_guidelines: tuple[str, ...] = ()
     scenario_playbook: tuple[dict[str, str], ...] = ()
@@ -49,6 +55,8 @@ class Campaign:
     human_followup_outcomes: tuple[str, ...] = ()
     hard_stop_phrases: dict[str, tuple[str, ...]] = field(default_factory=dict)
     faq_answers: dict[str, str] = field(default_factory=dict)
+    faq_aliases: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    faq_answer_only: tuple[str, ...] = ()
     prohibited_statements: tuple[str, ...] = ()
     behavior: dict[str, Any] = field(default_factory=dict)
 
@@ -349,6 +357,54 @@ class Campaign:
                 "disclosures at indices: "
                 + ", ".join(str(index) for index in invalid_opening_variants)
             )
+        personalized_preamble = dict(data.get("personalized_preamble", {}))
+        if personalized_preamble:
+            expected_preamble_keys = {
+                "recipient_confirmation",
+                "property_timing",
+                "qualification",
+            }
+            if set(personalized_preamble) != expected_preamble_keys or any(
+                not isinstance(value, str) or not value.strip()
+                for value in personalized_preamble.values()
+            ):
+                raise ValueError(
+                    "Campaign personalized_preamble requires recipient_confirmation, "
+                    "property_timing, and qualification strings"
+                )
+            expected_placeholders = {
+                "recipient_confirmation": {"recipient_name"},
+                "property_timing": {"property_reference"},
+                "qualification": set(),
+            }
+            for name, template in personalized_preamble.items():
+                try:
+                    placeholders = {
+                        field_name
+                        for _, field_name, _, _ in Formatter().parse(template)
+                        if field_name is not None
+                    }
+                except ValueError as error:
+                    raise ValueError(
+                        f"Campaign personalized_preamble.{name} is invalid"
+                    ) from error
+                if placeholders != expected_placeholders[name] or not template.endswith("?"):
+                    raise ValueError(
+                        f"Campaign personalized_preamble.{name} has invalid placeholders or punctuation"
+                    )
+            normalized_confirmation = personalized_preamble[
+                "recipient_confirmation"
+            ].casefold()
+            missing_preamble_disclosures = [
+                disclosure
+                for disclosure in required_disclosures
+                if disclosure.casefold() not in normalized_confirmation
+            ]
+            if missing_preamble_disclosures:
+                raise ValueError(
+                    "Campaign personalized recipient confirmation is missing required "
+                    "disclosures: " + ", ".join(missing_preamble_disclosures)
+                )
 
         behavior = dict(data.get("behavior", {}))
         for key in (
@@ -447,6 +503,55 @@ class Campaign:
             for question, answer in faq_answers.items()
         ):
             raise ValueError("Campaign FAQ questions and answers must be non-empty strings")
+        raw_faq_aliases = data.get("faq_aliases", {})
+        if not isinstance(raw_faq_aliases, dict):
+            raise ValueError("Campaign FAQ aliases must be an object")
+        unknown_faq_aliases = raw_faq_aliases.keys() - faq_answers.keys()
+        invalid_faq_aliases = [
+            question
+            for question, aliases in raw_faq_aliases.items()
+            if not isinstance(aliases, (list, tuple))
+            or not aliases
+            or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+        ]
+        if unknown_faq_aliases or invalid_faq_aliases:
+            raise ValueError(
+                "Campaign FAQ aliases are invalid for questions: "
+                + ", ".join(sorted(set(unknown_faq_aliases) | set(invalid_faq_aliases)))
+            )
+        faq_aliases = {
+            question: tuple(aliases)
+            for question, aliases in raw_faq_aliases.items()
+        }
+        faq_routes: dict[str, str] = {}
+        for question, aliases in (
+            (question, (question, *faq_aliases.get(question, ())))
+            for question in faq_answers
+        ):
+            for alias in aliases:
+                normalized_alias = normalize_match_text(alias)
+                existing_question = faq_routes.get(normalized_alias)
+                if existing_question is not None and existing_question != question:
+                    raise ValueError(
+                        "Campaign FAQ aliases overlap between questions: "
+                        f"{existing_question}, {question}"
+                    )
+                faq_routes[normalized_alias] = question
+        raw_faq_answer_only = data.get("faq_answer_only", ())
+        if not isinstance(raw_faq_answer_only, (list, tuple)) or any(
+            not isinstance(question, str) or not question.strip()
+            for question in raw_faq_answer_only
+        ):
+            raise ValueError(
+                "Campaign faq_answer_only must contain non-empty FAQ questions"
+            )
+        faq_answer_only = tuple(raw_faq_answer_only)
+        unknown_answer_only = set(faq_answer_only) - faq_answers.keys()
+        if unknown_answer_only or len(set(faq_answer_only)) != len(faq_answer_only):
+            raise ValueError(
+                "Campaign faq_answer_only references invalid FAQ questions: "
+                + ", ".join(sorted(unknown_answer_only or set(faq_answer_only)))
+            )
         prohibited_statements = tuple(data.get("prohibited_statements", ()))
         if any(
             not isinstance(statement, str) or not statement.strip()
@@ -585,6 +690,10 @@ class Campaign:
                 (f"opening_variants[{index}]", message)
                 for index, message in enumerate(opening_variants)
             ),
+            *(
+                (f"personalized_preamble.{name}", message)
+                for name, message in personalized_preamble.items()
+            ),
             *((f"questions.{name}", message) for name, message in data["questions"].items()),
             *(
                 (f"question_variants.{name}[{index}]", message)
@@ -634,6 +743,7 @@ class Campaign:
             transfer_unavailable_message=data["transfer_unavailable_message"],
             question_variants=question_variants,
             opening_variants=opening_variants,
+            personalized_preamble=personalized_preamble,
             conversation_brief=conversation_brief,
             conversation_guidelines=conversation_guidelines,
             scenario_playbook=scenario_playbook,
@@ -652,6 +762,8 @@ class Campaign:
             human_followup_outcomes=human_followup_outcomes,
             hard_stop_phrases=hard_stop_phrases,
             faq_answers=faq_answers,
+            faq_aliases=faq_aliases,
+            faq_answer_only=faq_answer_only,
             prohibited_statements=prohibited_statements,
             behavior=behavior,
         )

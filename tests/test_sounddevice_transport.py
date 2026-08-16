@@ -14,7 +14,7 @@ from speaking_agent.campaign import load_campaign
 from speaking_agent.mock_model import MockConversationModel
 from speaking_agent.speech import AudioFrame, PcmFormat
 from speaking_agent.speech import TranscriptEvent
-from speaking_agent.transport import TransportEventKind
+from speaking_agent.transport import TransportError, TransportEventKind
 from speaking_agent.turn_detection import EnergyTurnDetector, TurnDetectionConfig
 from speaking_agent.voice_session import CallSession
 
@@ -218,6 +218,54 @@ class OutputEchoSuppressorTests(unittest.TestCase):
 
 
 class SoundDeviceCallTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_playout_observer_receives_only_callback_consumed_audio(self) -> None:
+        audio = FakeAudio()
+        transport = SoundDeviceCallTransport(audio=audio)
+        played: list[AudioFrame] = []
+        transport.set_playout_observer(
+            lambda frame, started_at: played.append(frame)
+        )
+        await transport.prepare()
+        await transport.connect()
+        frame = AudioFrame(
+            data=tone(24_000, 500, 8_000),
+            format=PcmFormat(24_000),
+        )
+
+        await transport.send_audio(frame)
+        self.assertEqual(played, [])
+        rendered = audio.output_stream.pump_output()
+        await asyncio.sleep(0)
+
+        self.assertEqual(len(played), 1)
+        self.assertEqual(played[0].data, rendered)
+        await transport.close()
+
+    async def test_playout_observer_failure_is_not_silent(self) -> None:
+        audio = FakeAudio()
+        transport = SoundDeviceCallTransport(audio=audio)
+
+        def fail_recording(frame: AudioFrame, started_at: float) -> None:
+            del frame, started_at
+            raise RuntimeError("recording failed")
+
+        transport.set_playout_observer(fail_recording)
+        await transport.prepare()
+        await transport.connect()
+        await transport.send_audio(
+            AudioFrame(
+                data=tone(24_000, 500, 8_000),
+                format=PcmFormat(24_000),
+            )
+        )
+        audio.output_stream.pump_output()
+        await asyncio.sleep(0)
+
+        with self.assertRaisesRegex(TransportError, "recording failed"):
+            await transport.wait_for_playout()
+
+        await transport.close()
+
     async def test_stale_drain_callback_cannot_complete_new_playout(self) -> None:
         audio = FakeAudio()
         transport = SoundDeviceCallTransport(audio=audio)

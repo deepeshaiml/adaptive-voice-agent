@@ -8,9 +8,11 @@ import inspect
 from typing import Any
 
 from speaking_agent.answering import AnswerKind, AnsweringMachineDetector
+from speaking_agent.audio_recording import ConversationAudioRecorder
 from speaking_agent.campaign import Campaign
 from speaking_agent.conversation import ConversationSession
 from speaking_agent.domain import AgentReply, LeadOutcome, SessionAction
+from speaking_agent.domain import ConversationContext
 from speaking_agent.model import ConversationModel
 from speaking_agent.observability import LatencyTrace, TimingEventName
 from speaking_agent.speech import (
@@ -83,11 +85,14 @@ class CallSession:
         recognition_language: str | None = None,
         recognition_context: str = "",
         transfer_available: bool = True,
+        conversation_context: ConversationContext | None = None,
+        audio_recorder: ConversationAudioRecorder | None = None,
     ) -> None:
         self.conversation = ConversationSession(
             campaign,
             model,
             delivery_tracking=True,
+            context=conversation_context,
         )
         self.model = model
         self.recognizer = recognizer
@@ -105,6 +110,18 @@ class CallSession:
         self._do_not_contact_persisted = False
         self._disclosure_delivered = False
         self._transfer_available = transfer_available
+        self.audio_recorder = audio_recorder
+        if audio_recorder is not None:
+            set_playout_observer = getattr(
+                self.transport,
+                "set_playout_observer",
+                None,
+            )
+            if set_playout_observer is None:
+                raise TypeError(
+                    "Audio recording requires transport playout observation"
+                )
+            set_playout_observer(audio_recorder.record_agent_audio)
         self.interruptions = 0
         self._answer_kind: AnswerKind | None = (
             AnswerKind.HUMAN if answering_detector is None else None
@@ -191,6 +208,8 @@ class CallSession:
                             self.conversation.abort()
                             finished = True
                         elif event.audio is not None:
+                            if self.audio_recorder is not None:
+                                self.audio_recorder.record_owner_audio(event.audio)
                             for turn_event in self.turn_detector.process(event.audio):
                                 if turn_event.kind == TurnEventKind.SPEECH_STARTED:
                                     listening_deadline = None
@@ -322,6 +341,14 @@ class CallSession:
         await self.synthesizer.prepare()
         if self.answering_detector is not None:
             await self.answering_detector.prepare()
+        if self.audio_recorder is not None:
+            await self.audio_recorder.prepare(
+                call_id=self.conversation.state.call_id,
+                campaign_id=self.conversation.campaign.campaign_id,
+                retention_days=int(
+                    self.conversation.campaign.behavior["data_retention_days"]
+                ),
+            )
 
     async def _close(self) -> None:
         timeout_seconds = float(
@@ -340,6 +367,8 @@ class CallSession:
                 ("transport", self.transport.close),
             )
         )
+        if self.audio_recorder is not None:
+            operations.append(("audio_recorder", self.audio_recorder.close))
         for name, operation in operations:
             try:
                 async with asyncio.timeout(timeout_seconds):
@@ -415,6 +444,14 @@ class CallSession:
                                 reply=AgentReply("Goodbye.", SessionAction.HANG_UP)
                             )
                         )
+                    return
+                if (
+                    hard_stop is None
+                    and self.conversation.awaiting_recipient_confirmation
+                ):
+                    opening = self.conversation.start()
+                    self._deferred_reply = None
+                    await self._queue.put(_TurnFinished(reply=opening))
                     return
                 self.conversation.start(remember_reply=False)
             self.trace.record(TimingEventName.LLM_START)

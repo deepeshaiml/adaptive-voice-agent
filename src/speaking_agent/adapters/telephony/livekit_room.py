@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 import importlib
+import time
 from typing import Any
 
 from speaking_agent.speech import AudioFrame, PcmFormat
@@ -47,6 +48,15 @@ class LiveKitRoomTransport:
         self._publication: Any | None = None
         self._connected = False
         self._closing = False
+        self._playout_observer: Callable[[AudioFrame, float], None] | None = None
+        self._pending_playout: list[tuple[AudioFrame, float]] = []
+        self._playout_cursor = 0.0
+
+    def set_playout_observer(
+        self,
+        observer: Callable[[AudioFrame, float], None] | None,
+    ) -> None:
+        self._playout_observer = observer
 
     async def prepare(self) -> None:
         try:
@@ -145,12 +155,21 @@ class LiveKitRoomTransport:
             samples_per_channel=frame.sample_count,
         )
         await self._audio_source.capture_frame(livekit_frame)
+        started_at = max(time.monotonic(), self._playout_cursor)
+        self._playout_cursor = started_at + frame.duration_seconds
+        self._pending_playout.append((frame, started_at))
 
     async def wait_for_playout(self) -> None:
         if self._audio_source is not None:
             await self._audio_source.wait_for_playout()
+        if self._playout_observer is not None:
+            for frame, started_at in self._pending_playout:
+                self._playout_observer(frame, started_at)
+        self._pending_playout.clear()
+        self._playout_cursor = time.monotonic()
 
     async def stop_audio(self) -> None:
+        self._pending_playout.clear()
         if self._audio_source is not None:
             self._audio_source.clear_queue()
 
@@ -186,6 +205,8 @@ class LiveKitRoomTransport:
                 errors.append(error)
             self._audio_source = None
         self._connected = False
+        self._pending_playout.clear()
+        self._playout_cursor = 0.0
         if errors:
             raise TransportError(
                 "LiveKit transport cleanup failed: "
