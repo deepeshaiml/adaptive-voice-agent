@@ -242,6 +242,71 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Marina Gate", confirmed_reply.text)
 
+    async def test_unrecognized_recipient_confirmation_is_bounded(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+            context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+        )
+        opening = session.start()
+
+        first_reply = await session.receive("I forgot")
+        final_reply = await session.receive("That did not make sense")
+
+        self.assertNotEqual(first_reply.text, opening.text)
+        self.assertFalse("Marina Gate" in first_reply.text)
+        self.assertEqual(final_reply.action, SessionAction.HANG_UP)
+        self.assertEqual(session.result().outcome, "UNKNOWN")
+
+    def test_confirmation_noise_classifier_is_conservative(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+            context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+        )
+        policy = session.policy
+        for noise in ("Ah", "Uh", "Um", "Hi", "Hello"):
+            with self.subTest(noise=noise):
+                self.assertTrue(
+                    policy.is_confirmation_noise(noise)
+                )
+        for meaningful in ("Yes", "Speaking", "No", "This is Ali"):
+            with self.subTest(meaningful=meaningful):
+                self.assertFalse(
+                    policy.is_confirmation_noise(meaningful)
+                )
+
+        for prompt_fragment in (
+            "Speaking",
+            "Mr. Ahmed",
+            "Ahmed",
+            "I'm Sam",
+            "automated assistant",
+        ):
+            with self.subTest(prompt_fragment=prompt_fragment):
+                self.assertEqual(
+                    session.classify_recipient_confirmation_overlap(
+                        prompt_fragment
+                    ),
+                    "noise",
+                )
+        for explicit in ("Yes", "Yeah", "That's me"):
+            with self.subTest(explicit=explicit):
+                self.assertEqual(
+                    session.classify_recipient_confirmation_overlap(explicit),
+                    "confirmed",
+                )
+        self.assertEqual(
+            session.classify_recipient_confirmation_overlap("This is Ali"),
+            "denied",
+        )
+
     async def test_personalized_confirmation_matches_ordered_unicode_name(self) -> None:
         cases = (
             ("Mr. Ahmed Ali", "This is Ahmed Ali", True),
@@ -2041,6 +2106,55 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(session.state.human_transfer_requested)
         self.assertEqual(reply.action, SessionAction.TRANSFER)
+
+    async def test_terminal_override_clears_stale_transfer_and_callback(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(
+                {
+                    "transfer me": ModelInterpretation(
+                        suggested_outcome="HUMAN_TRANSFER",
+                        human_transfer_requested=True,
+                    )
+                }
+            ),
+            context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+        )
+        session.start()
+        await session.receive("Yes")
+        await session.receive("Yes, go ahead")
+        transfer_reply = await session.receive("transfer me")
+        self.assertEqual(transfer_reply.action, SessionAction.TRANSFER)
+
+        denial_reply = await session.receive(
+            "This is Ali",
+            captured_confirmation=True,
+        )
+
+        self.assertEqual(session.result().outcome, "WRONG_NUMBER")
+        self.assertFalse(session.state.human_transfer_requested)
+        self.assertFalse(session.state.callback_requested)
+        self.assertEqual(denial_reply.action, SessionAction.HANG_UP)
+
+        session.state.callback_requested = True
+        session.policy.apply_outcome(session.state, "NOT_INTERESTED")
+
+        self.assertFalse(session.state.callback_requested)
+        self.assertFalse(session.state.human_transfer_requested)
+
+    def test_callback_and_transfer_outcomes_clear_each_other(self) -> None:
+        session = ConversationSession(self.campaign, MockConversationModel())
+
+        session.policy.apply_outcome(session.state, "CALLBACK")
+        self.assertTrue(session.state.callback_requested)
+        self.assertFalse(session.state.human_transfer_requested)
+
+        session.policy.apply_outcome(session.state, "HUMAN_TRANSFER")
+        self.assertFalse(session.state.callback_requested)
+        self.assertTrue(session.state.human_transfer_requested)
 
     async def test_explicit_callback_cancellation_clears_state(self) -> None:
         session = ConversationSession(

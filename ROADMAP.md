@@ -8,7 +8,7 @@ Checklist meaning:
 - `[ ]` is incomplete; partial foundations are described explicitly and must not be
       interpreted as platform support.
 
-Current validation baseline: **214 unit/scenario/adapter tests**, clean `pip check`,
+Current validation baseline: **230 unit/scenario/adapter tests**, clean `pip check`,
 clean bytecode compilation, clean `git diff --check`, resolved local Markdown links,
 and no editor diagnostics. A single warm local Qwen planning smoke completed in 1.214
 seconds. That number is useful as a regression signal only; repeatable P50/P95
@@ -146,6 +146,10 @@ Keep application protocols unchanged and select adapters through one composition
       instruction while retaining explicit sampling controls for experiments.
 - [x] Keep hesitation fragments from consuming retry budget, scope retries to the pending
       field, accept filler-prefixed booleans, and stop repeated unknown-price/listing loops.
+- [x] Protect the disclosed recipient-confirmation opening from acoustic self-barge-in,
+      queue meaningful overlap, ignore low-information echo transcripts, and bound retries.
+- [x] Defer terminal hangup only for already-started microphone activity so sub-threshold
+      late do-not-contact speech can mature, complete, and persist before teardown.
 - [x] Cover common property-owner scenarios with conditional guidance and safe approved
       responses without inventing buyer, WhatsApp, transaction, or valuation tools.
 - [x] Support validated in-memory recipient/property metadata with an optional disclosed

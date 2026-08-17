@@ -66,6 +66,12 @@ class _TransferFinished:
     error: BaseException | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AudioTurn:
+    frames: tuple[AudioFrame, ...]
+    confirmation_overlap: bool = False
+
+
 class CallSession:
     def __init__(
         self,
@@ -137,10 +143,13 @@ class CallSession:
         self._playback_task: asyncio.Task[None] | None = None
         self._turn_task: asyncio.Task[None] | None = None
         self._transfer_task: asyncio.Task[None] | None = None
-        self._active_turn_frames: tuple[AudioFrame, ...] | None = None
-        self._pending_turns: deque[tuple[AudioFrame, ...]] = deque()
+        self._active_turn: _AudioTurn | None = None
+        self._pending_turns: deque[_AudioTurn] = deque()
         self._deferred_reply: AgentReply | None = None
         self._active_reply: AgentReply | None = None
+        self._confirmation_overlap_turn = False
+        self._speech_in_progress = False
+        self._pending_terminal_action: SessionAction | None = None
         self._cleanup_errors: list[str] = []
 
     async def run(self) -> VoiceCallResult:
@@ -177,6 +186,16 @@ class CallSession:
                             async with asyncio.timeout(remaining):
                                 event = await self._queue.get()
                     except TimeoutError:
+                        if self._pending_terminal_action is not None:
+                            pending_action = self._pending_terminal_action
+                            self._pending_terminal_action = None
+                            listening_deadline = None
+                            if pending_action == SessionAction.HANG_UP:
+                                await self.transport.hang_up()
+                                finished = True
+                            elif pending_action == SessionAction.TRANSFER:
+                                await self._start_transfer()
+                            continue
                         self.conversation.abort()
                         try:
                             await self.transport.hang_up()
@@ -210,21 +229,69 @@ class CallSession:
                         elif event.audio is not None:
                             if self.audio_recorder is not None:
                                 self.audio_recorder.record_owner_audio(event.audio)
-                            for turn_event in self.turn_detector.process(event.audio):
+                            had_pending_speech = self.turn_detector.has_pending_speech
+                            turn_events = self.turn_detector.process(event.audio)
+                            if (
+                                not had_pending_speech
+                                and self.turn_detector.has_candidate_speech
+                            ):
+                                self._confirmation_overlap_turn = (
+                                    self._confirmation_capture_context_active()
+                                )
+                            for turn_event in turn_events:
                                 if turn_event.kind == TurnEventKind.SPEECH_STARTED:
                                     listening_deadline = None
-                                    if await self._interrupt_playback():
+                                    self._speech_in_progress = True
+                                    if self._transfer_task is not None:
+                                        await self._cancel_transfer_task()
+                                        self._pending_terminal_action = (
+                                            SessionAction.TRANSFER
+                                        )
+                                    self._confirmation_overlap_turn = (
+                                        self._confirmation_overlap_turn
+                                        or self._confirmation_capture_context_active()
+                                    )
+                                    protect_confirmation = (
+                                        self._confirmation_playback_is_protected()
+                                    )
+                                    if (
+                                        not protect_confirmation
+                                        and await self._interrupt_playback()
+                                    ):
                                         await self._notify(
                                             self._on_interruption,
                                             None,
                                         )
                                 else:
                                     listening_deadline = None
+                                    self._speech_in_progress = False
                                     self.trace.record(TimingEventName.SPEECH_END)
-                                    await self._start_turn(turn_event.frames)
+                                    if self._confirmation_overlap_turn:
+                                        self._confirmation_overlap_turn = False
+                                        confirmation_delivered = (
+                                            self.conversation.recipient_confirmation_delivered
+                                        )
+                                        if confirmation_delivered:
+                                            await self._start_turn(
+                                                turn_event.frames,
+                                                confirmation_overlap=True,
+                                            )
+                                        else:
+                                            self._pending_turns.append(
+                                                _AudioTurn(
+                                                    turn_event.frames,
+                                                    confirmation_overlap=True,
+                                                )
+                                            )
+                                    else:
+                                        await self._start_turn(turn_event.frames)
+                            if not turn_events:
+                                if not self.turn_detector.has_pending_speech:
+                                    self._confirmation_overlap_turn = False
+                                await self._resume_deferred_reply_if_input_idle()
                     elif isinstance(event, _TurnFinished):
                         self._turn_task = None
-                        self._active_turn_frames = None
+                        self._active_turn = None
                         if event.error is not None:
                             terminal_error = event.error
                             self.conversation.abort()
@@ -236,24 +303,45 @@ class CallSession:
                                 )
                             finished = True
                         elif event.reply is not None:
-                            if self.conversation.state.do_not_contact:
+                            self._pending_terminal_action = None
+                            if (
+                                self.conversation.state.outcome
+                                != "HUMAN_TRANSFER"
+                            ):
                                 await self._cancel_transfer_task()
-                            if self._pending_turns:
+                            if self._has_pending_input():
                                 self._deferred_reply = event.reply
                                 self.conversation.mark_agent_reply_delivery(
                                     event.reply.text,
                                     "pending",
                                 )
-                                await self._start_turn(self._pending_turns.popleft())
+                                if self._pending_turns:
+                                    await self._start_turn(
+                                        self._pending_turns.popleft()
+                                    )
                             else:
                                 await self._start_playback(event.reply)
                         elif event.ignored:
                             if self._pending_turns:
                                 await self._start_turn(self._pending_turns.popleft())
-                            elif self._deferred_reply is not None:
+                            elif (
+                                self._deferred_reply is not None
+                                and not self._has_pending_input()
+                            ):
                                 deferred_reply = self._deferred_reply
                                 self._deferred_reply = None
                                 await self._start_playback(deferred_reply)
+                            elif (
+                                self._pending_terminal_action is not None
+                                and not self.turn_detector.has_pending_speech
+                            ):
+                                pending_action = self._pending_terminal_action
+                                self._pending_terminal_action = None
+                                if pending_action == SessionAction.HANG_UP:
+                                    await self.transport.hang_up()
+                                    finished = True
+                                elif pending_action == SessionAction.TRANSFER:
+                                    await self._start_transfer()
                             else:
                                 listening_deadline = event_loop.time() + float(
                                     self.conversation.campaign.behavior[
@@ -262,10 +350,12 @@ class CallSession:
                                 )
                     elif isinstance(event, _SilentAction):
                         self._turn_task = None
-                        self._active_turn_frames = None
+                        self._active_turn = None
                         if event.action == SessionAction.HANG_UP:
                             await self.transport.hang_up()
                             finished = True
+                        elif event.action == SessionAction.TRANSFER:
+                            await self._start_transfer()
                         else:
                             terminal_error = RuntimeError(
                                 "Unsupported silent call action"
@@ -310,10 +400,39 @@ class CallSession:
                             if event.disclosure_delivered:
                                 self._disclosure_delivered = True
                             if event.action == SessionAction.HANG_UP:
-                                await self.transport.hang_up()
-                                finished = True
+                                if self._has_pending_input():
+                                    self._pending_terminal_action = (
+                                        SessionAction.HANG_UP
+                                    )
+                                    if self._has_confirmed_input():
+                                        listening_deadline = None
+                                    else:
+                                        listening_deadline = (
+                                            event_loop.time()
+                                            + self._terminal_candidate_grace_seconds()
+                                        )
+                                else:
+                                    await self.transport.hang_up()
+                                    finished = True
                             elif event.action == SessionAction.TRANSFER:
-                                await self._start_transfer()
+                                if self._has_pending_input():
+                                    self._pending_terminal_action = (
+                                        SessionAction.TRANSFER
+                                    )
+                                    if self._has_confirmed_input():
+                                        listening_deadline = None
+                                    else:
+                                        listening_deadline = (
+                                            event_loop.time()
+                                            + self._terminal_candidate_grace_seconds()
+                                        )
+                                else:
+                                    await self._start_transfer()
+                            elif self._pending_turns:
+                                listening_deadline = None
+                                await self._start_turn(
+                                    self._pending_turns.popleft()
+                                )
                             else:
                                 listening_deadline = event_loop.time() + float(
                                     self.conversation.campaign.behavior[
@@ -392,28 +511,65 @@ class CallSession:
                 )
             )
 
-    async def _start_turn(self, frames: tuple[AudioFrame, ...]) -> None:
+    async def _start_turn(
+        self,
+        frames: tuple[AudioFrame, ...] | _AudioTurn,
+        *,
+        confirmation_overlap: bool = False,
+    ) -> None:
         if self._task_group is None:
             return
+        turn = (
+            frames
+            if isinstance(frames, _AudioTurn)
+            else _AudioTurn(
+                frames,
+                confirmation_overlap=confirmation_overlap,
+            )
+        )
         if self._turn_task is not None:
-            self._pending_turns.append(frames)
+            self._pending_turns.append(turn)
             return
-        self._active_turn_frames = frames
+        self._active_turn = turn
         self._turn_task = self._task_group.create_task(
-            self._process_turn_and_notify(frames)
+            self._process_turn_and_notify(turn)
         )
 
-    async def _process_turn_and_notify(self, frames: tuple[AudioFrame, ...]) -> None:
+    async def _process_turn_and_notify(self, turn: _AudioTurn) -> None:
         try:
-            final_text = await self._transcribe_turn(frames)
-            await self._notify(self._on_transcript, final_text)
+            final_text = await self._transcribe_turn(turn.frames)
             hard_stop = self.conversation.policy.hard_stop_outcome(final_text)
+            confirmation: str | None = None
+            if turn.confirmation_overlap and hard_stop is None:
+                confirmation = (
+                    self.conversation.classify_recipient_confirmation_overlap(
+                        final_text
+                    )
+                )
             if self.conversation.state.ended and hard_stop is None:
-                deferred_reply = self._deferred_reply
-                self._deferred_reply = None
-                if deferred_reply is not None:
-                    await self._queue.put(_TurnFinished(reply=deferred_reply))
+                if confirmation == "denied":
+                    await self._notify(self._on_transcript, final_text)
+                    reply = await self.conversation.receive(
+                        final_text,
+                        captured_confirmation=True,
+                    )
+                    self._deferred_reply = None
+                    await self._queue.put(_TurnFinished(reply=reply))
+                else:
+                    await self._queue.put(_TurnFinished(ignored=True))
                 return
+            if confirmation == "noise":
+                terminal_reply = (
+                    self.conversation.register_recipient_confirmation_noise()
+                )
+                await self._queue.put(
+                    _TurnFinished(
+                        reply=terminal_reply,
+                        ignored=terminal_reply is None,
+                    )
+                )
+                return
+            await self._notify(self._on_transcript, final_text)
             if self._answer_kind is None and self.answering_detector is not None:
                 self._answer_kind = (
                     AnswerKind.HUMAN
@@ -454,8 +610,18 @@ class CallSession:
                     await self._queue.put(_TurnFinished(reply=opening))
                     return
                 self.conversation.start(remember_reply=False)
+            if turn.confirmation_overlap and hard_stop is None:
+                if (
+                    not self.conversation.awaiting_recipient_confirmation
+                    and confirmation != "denied"
+                ):
+                    await self._queue.put(_TurnFinished(ignored=True))
+                    return
             self.trace.record(TimingEventName.LLM_START)
-            reply = await self.conversation.receive(final_text)
+            reply = await self.conversation.receive(
+                final_text,
+                captured_confirmation=turn.confirmation_overlap,
+            )
             self._deferred_reply = None
             await self._persist_do_not_contact_if_needed()
             self.trace.record(TimingEventName.LLM_FIRST_TOKEN, streaming=False)
@@ -466,6 +632,65 @@ class CallSession:
             await self._queue.put(_TurnFinished(ignored=True))
         except BaseException as error:
             await self._queue.put(_TurnFinished(error=error))
+
+    def _confirmation_playback_is_protected(self) -> bool:
+        task = self._playback_task
+        active_reply = self._active_reply
+        normalized_opening = " ".join(self.conversation.opening.split())
+        return (
+            not self.conversation.state.ended
+            and self.conversation.awaiting_recipient_confirmation
+            and not self.conversation.recipient_confirmation_delivered
+            and active_reply is not None
+            and " ".join(active_reply.text.split()).endswith(normalized_opening)
+            and task is not None
+            and not task.done()
+        )
+
+    def _confirmation_capture_context_active(self) -> bool:
+        return (
+            self.conversation.recipient_confirmation_issued
+            or (
+                self._active_turn is not None
+                and self._active_turn.confirmation_overlap
+            )
+            or any(turn.confirmation_overlap for turn in self._pending_turns)
+        )
+
+    def _has_pending_input(self) -> bool:
+        return (
+            self._speech_in_progress
+            or self.turn_detector.has_pending_speech
+            or self._turn_task is not None
+            or bool(self._pending_turns)
+        )
+
+    def _has_confirmed_input(self) -> bool:
+        return (
+            self._speech_in_progress
+            or self.turn_detector.is_speaking
+            or self._turn_task is not None
+            or bool(self._pending_turns)
+        )
+
+    def _terminal_candidate_grace_seconds(self) -> float:
+        minimum_speech_seconds = (
+            self.turn_detector.config.minimum_speech_ms / 1_000
+        )
+        return max(0.25, minimum_speech_seconds + 0.2)
+
+    async def _resume_deferred_reply_if_input_idle(self) -> None:
+        if self._playback_task is not None or self._has_pending_input():
+            return
+        if self._deferred_reply is not None:
+            deferred_reply = self._deferred_reply
+            self._deferred_reply = None
+            await self._start_playback(deferred_reply)
+            return
+        if self._pending_terminal_action is not None:
+            pending_action = self._pending_terminal_action
+            self._pending_terminal_action = None
+            await self._queue.put(_SilentAction(pending_action))
 
     async def _transcribe_turn(self, frames: tuple[AudioFrame, ...]) -> str:
         final_text = ""
@@ -495,19 +720,19 @@ class CallSession:
             await self._persist_do_not_contact_if_needed()
             return
 
-        turns: list[tuple[AudioFrame, ...]] = []
-        if self._active_turn_frames is not None:
-            turns.append(self._active_turn_frames)
+        turns: list[_AudioTurn] = []
+        if self._active_turn is not None:
+            turns.append(self._active_turn)
         turns.extend(self._pending_turns)
         flushed_turn = self.turn_detector.flush()
         if flushed_turn is not None and flushed_turn.frames:
-            turns.append(flushed_turn.frames)
+            turns.append(_AudioTurn(flushed_turn.frames))
 
         await self._cancel_turn_task()
         self._pending_turns.clear()
-        for frames in turns:
+        for turn in turns:
             try:
-                final_text = await self._transcribe_turn(frames)
+                final_text = await self._transcribe_turn(turn.frames)
             except SpeechNotRecognizedError:
                 continue
             await self._notify(self._on_transcript, final_text)
@@ -658,7 +883,7 @@ class CallSession:
             except asyncio.CancelledError:
                 pass
         self._turn_task = None
-        self._active_turn_frames = None
+        self._active_turn = None
 
     async def _cancel_transfer_task(self) -> None:
         if self._transfer_task is not None and not self._transfer_task.done():

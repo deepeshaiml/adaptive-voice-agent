@@ -18,7 +18,7 @@ from speaking_agent.domain import (
 )
 from speaking_agent.model import ConversationModel, ConversationModelError
 from speaking_agent.policy import ConversationPolicy
-from speaking_agent.text_safety import normalize_text
+from speaking_agent.text_safety import normalize_match_text, normalize_text
 
 
 class ConversationSession:
@@ -60,12 +60,63 @@ class ConversationSession:
         else:
             self.opening = opening_choices[opening_index]
         self._recipient_confirmation_delivered = self._preamble_phase is None
+        self._recipient_confirmation_attempts = 0
         self._delivery_tracking = delivery_tracking
         self._started = False
 
     @property
     def awaiting_recipient_confirmation(self) -> bool:
         return self._preamble_phase == "recipient_confirmation"
+
+    @property
+    def recipient_confirmation_delivered(self) -> bool:
+        return self._recipient_confirmation_delivered
+
+    @property
+    def recipient_confirmation_issued(self) -> bool:
+        return self._started and self.awaiting_recipient_confirmation
+
+    def classify_recipient_confirmation(self, utterance: str) -> str:
+        normalized = normalize_text(utterance).strip(".,!? ")
+        if self._recipient_denied(normalized):
+            return "denied"
+        if self._recipient_confirmed(normalized):
+            return "confirmed"
+        if self.policy.is_confirmation_noise(utterance):
+            return "noise"
+        return "unknown"
+
+    def classify_recipient_confirmation_overlap(self, utterance: str) -> str:
+        normalized = normalize_text(utterance).strip(".,!? ")
+        match_text = normalize_match_text(utterance)
+        normalized_opening = normalize_match_text(self.opening)
+        explicit_affirmative = re.fullmatch(
+            r"(?:yes|yeah|yep|that's me|that is me|"
+            r"yes that's me|yes that is me)",
+            normalized,
+        )
+        if explicit_affirmative is not None:
+            return "confirmed"
+        if re.search(
+            rf"(?:^|\s){re.escape(match_text)}(?:$|\s)",
+            normalized_opening,
+        ):
+            return "noise"
+        classification = self.classify_recipient_confirmation(utterance)
+        if classification == "confirmed":
+            return "noise"
+        return classification
+
+    def register_recipient_confirmation_noise(self) -> AgentReply | None:
+        if not self.awaiting_recipient_confirmation:
+            return None
+        self._recipient_confirmation_attempts += 1
+        maximum_attempts = int(
+            self.campaign.behavior.get("max_unclear_retries", 2)
+        )
+        if self._recipient_confirmation_attempts >= maximum_attempts:
+            return self._finish("UNKNOWN")
+        return None
 
     def start(self, *, remember_reply: bool = True) -> AgentReply:
         if self._started:
@@ -93,18 +144,33 @@ class ConversationSession:
                 self._recipient_confirmation_delivered = True
         return reply
 
-    async def receive(self, utterance: str) -> AgentReply:
+    async def receive(
+        self,
+        utterance: str,
+        *,
+        captured_confirmation: bool = False,
+    ) -> AgentReply:
         if not self._started:
             raise RuntimeError("Conversation session has not started")
 
         hard_stop_outcome = self.policy.hard_stop_outcome(utterance)
-        if self.state.ended and hard_stop_outcome is None:
+        captured_denial = (
+            captured_confirmation
+            and self.classify_recipient_confirmation(utterance) == "denied"
+        )
+        if (
+            self.state.ended
+            and hard_stop_outcome is None
+            and not captured_denial
+        ):
             raise RuntimeError("Conversation session has ended")
         prior_model_state = deepcopy(self.state)
         self._remember_owner_utterance(utterance)
         if hard_stop_outcome is not None:
             self.policy.apply_outcome(self.state, hard_stop_outcome)
             return self._finish(hard_stop_outcome)
+        if captured_denial:
+            return self._finish("WRONG_NUMBER")
         skipped_field = self.policy.explicitly_skipped_field(
             self.state,
             utterance,
@@ -324,15 +390,33 @@ class ConversationSession:
             return None
         normalized = normalize_text(utterance).strip(".,!? ")
         if self._preamble_phase == "recipient_confirmation":
-            if self._recipient_denied(normalized):
+            classification = self.classify_recipient_confirmation(utterance)
+            if classification == "denied":
                 return self._finish("WRONG_NUMBER")
             if not self._recipient_confirmation_delivered:
                 return self._remember_agent_reply(AgentReply(self.opening))
-            if self._recipient_confirmed(normalized):
+            if classification == "confirmed":
                 self._preamble_phase = "property_timing"
+                self._recipient_confirmation_attempts = 0
                 return self._remember_agent_reply(
                     AgentReply(self._current_preamble_prompt())
                 )
+            maximum_attempts = int(
+                self.campaign.behavior.get("max_unclear_retries", 2)
+            )
+            if classification == "noise":
+                terminal_reply = self.register_recipient_confirmation_noise()
+                if terminal_reply is not None:
+                    return terminal_reply
+                return self._remember_agent_reply(
+                    AgentReply(
+                        "Sorry, I didn't catch that. Are you "
+                        f"{self.context.recipient_name}?"
+                    )
+                )
+            self._recipient_confirmation_attempts += 1
+            if self._recipient_confirmation_attempts >= maximum_attempts:
+                return self._finish("UNKNOWN")
             return self._remember_agent_reply(
                 AgentReply(
                     f"Sorry, am I speaking with {self.context.recipient_name}?"

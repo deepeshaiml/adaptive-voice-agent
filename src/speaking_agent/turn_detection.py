@@ -39,6 +39,18 @@ class EnergyTurnDetector:
         self._trailing_silence_frames = 0
         self._speaking = False
 
+    @property
+    def has_pending_speech(self) -> bool:
+        return self._speaking or bool(self._candidate)
+
+    @property
+    def has_candidate_speech(self) -> bool:
+        return bool(self._candidate) and not self._speaking
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._speaking
+
     def process(self, frame: AudioFrame) -> tuple[TurnEvent, ...]:
         duration_ms = frame.duration_seconds * 1_000
         has_speech = self._energy(frame) >= self.config.energy_threshold

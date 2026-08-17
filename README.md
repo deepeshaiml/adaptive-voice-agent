@@ -32,7 +32,7 @@ Status last verified on **2026-08-16** on Apple-silicon macOS with Python 3.12:
 | SQLite outcomes, suppression, retention, and metrics | Complete and tested |
 | Linux, Windows, CUDA, and portable inference | Not yet integrated or natively verified |
 
-The current validation passes **214 tests**, `pip check`, bytecode compilation, diff
+The current validation passes **230 tests**, `pip check`, bytecode compilation, diff
 validation, local Markdown-link checks, and editor diagnostics. A real local Qwen
 planning smoke completed in 1.214 seconds for one warm single-turn scenario; this is a
 smoke measurement, not a P50/P95 benchmark. Independent blocker review found no release
@@ -245,6 +245,24 @@ The microphone remains active while the agent speaks. Confirmed near-end speech 
 the current TTS playback, preserves the interruption, and immediately enters the normal
 ASR/LLM/TTS flow. The terminal reports the transcript and interruption count without a
 separate “Listening” phase.
+
+The personalized recipient-confirmation opening is a deliberate exception: it must finish
+before barge-in is enabled because it contains required disclosure and gates private
+property metadata. Audio spoken over that opening is queued; meaningful replies such as
+“Yes” are processed immediately after delivery, while low-information echo-like ASR
+fragments such as “Ah”, “Um”, “Hi”, or “Hello” are ignored. Normal barge-in resumes for
+all later turns. Unrecognized confirmation replies are bounded and cannot replay the
+opening indefinitely.
+
+Terminal hangup also checks for microphone speech that began just before closing
+playout completed. A short bounded grace lets candidate speech cross the VAD threshold;
+confirmed speech is then allowed to finish so late do-not-contact requests can override
+the prior outcome and persist before hangup. Calls with no pending microphone activity
+still hang up immediately after playout.
+
+Privacy-sensitive replies are also deferred from the first candidate speech frame, not
+only after VAD confirmation. This prevents an earlier queued “Yes” from causing property
+metadata playback while a later wrong-recipient correction is still being spoken.
 
 With speakers, full-duplex mode uses the outgoing PCM as an echo reference and rejects
 correlated or low-energy loopback. This is an experimental software echo suppressor, not

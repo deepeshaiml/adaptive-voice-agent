@@ -144,6 +144,19 @@ class ConversationPolicy:
         ) is not None
 
     @staticmethod
+    def is_confirmation_noise(utterance: str) -> bool:
+        normalized = normalize_match_text(utterance)
+        return normalized in {
+            "ah",
+            "uh",
+            "um",
+            "hmm",
+            "hi",
+            "hello",
+            "hey",
+        }
+
+    @staticmethod
     def is_direct_question(utterance: str) -> bool:
         normalized = normalize_match_text(utterance)
         if "?" in utterance:
@@ -568,14 +581,14 @@ class ConversationPolicy:
         state.outcome = outcome
         if self.campaign.outcome_field is not None:
             state.fields[self.campaign.outcome_field] = outcome
+        state.human_transfer_requested = outcome == "HUMAN_TRANSFER"
         if outcome == "DO_NOT_CONTACT":
             state.do_not_contact = True
             state.callback_requested = False
-            state.human_transfer_requested = False
         elif outcome == "CALLBACK":
             state.callback_requested = True
-        elif outcome == "HUMAN_TRANSFER":
-            state.human_transfer_requested = True
+        elif outcome in self.campaign.terminal_outcomes or outcome == "UNKNOWN":
+            state.callback_requested = False
 
     def next_missing_field(self, state: ConversationState) -> str | None:
         fields = self._deduplicated(
