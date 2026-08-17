@@ -2460,6 +2460,95 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.lead.outcome, "NOT_INTERESTED")
         self.assertTrue(transport.hung_up)
 
+    async def test_repeated_terminal_interruptions_are_bounded(self) -> None:
+        class SequencedRecognizer:
+            def __init__(self) -> None:
+                self.responses = iter(
+                    ("not interested", "wait a moment", "wait a moment")
+                )
+
+            async def prepare(self):
+                return None
+
+            async def close(self):
+                return None
+
+            async def cancel(self):
+                return None
+
+            async def transcribe(self, audio, **kwargs):
+                del kwargs
+                async for _ in audio:
+                    pass
+                yield TranscriptEvent(text=next(self.responses), is_final=True)
+
+        class ControlledSynthesizer:
+            def __init__(self) -> None:
+                self.started: asyncio.Queue[tuple[str, asyncio.Event]] = (
+                    asyncio.Queue()
+                )
+                self.texts: list[str] = []
+
+            async def prepare(self):
+                return None
+
+            async def close(self):
+                return None
+
+            async def cancel(self):
+                return None
+
+            async def synthesize(self, text, **kwargs):
+                del kwargs
+                release = asyncio.Event()
+                self.texts.append(text)
+                yield audio_frame(0)
+                await self.started.put((text, release))
+                await release.wait()
+
+        transport = MockCallTransport()
+        synthesizer = ControlledSynthesizer()
+        session = CallSession(
+            campaign=load_campaign(CAMPAIGN_PATH),
+            model=MockConversationModel(),
+            recognizer=SequencedRecognizer(),
+            synthesizer=synthesizer,
+            transport=transport,
+            turn_detector=EnergyTurnDetector(
+                TurnDetectionConfig(
+                    energy_threshold=0.02,
+                    minimum_speech_ms=60,
+                    end_silence_ms=60,
+                )
+            ),
+        )
+
+        run_task = asyncio.create_task(session.run())
+        _, opening_release = await asyncio.wait_for(
+            synthesizer.started.get(),
+            timeout=0.2,
+        )
+        opening_release.set()
+        while session._playback_task is not None:
+            await asyncio.sleep(0)
+
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        await asyncio.wait_for(synthesizer.started.get(), timeout=0.2)
+
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        await asyncio.wait_for(synthesizer.started.get(), timeout=0.2)
+
+        for amplitude in (5_000, 5_000, 5_000, 5_000, 0, 0, 0):
+            await transport.emit_audio(audio_frame(amplitude))
+        result = await asyncio.wait_for(run_task, timeout=0.2)
+
+        self.assertEqual(result.lead.outcome, "NOT_INTERESTED")
+        self.assertEqual(result.interruptions, 2)
+        self.assertEqual(len(synthesizer.texts), 3)
+        self.assertTrue(transport.hung_up)
+
     @staticmethod
     async def _append_async(values: list[str], value: str) -> None:
         values.append(value)

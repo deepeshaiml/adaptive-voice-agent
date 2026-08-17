@@ -609,6 +609,10 @@
       "what can you get for my property",
       "can you tell me the range",
       "can you tell me the price range",
+      "can you suggest the going price",
+      "what are the price going on for this property",
+      "what are the prices going on for this property",
+      "what is the going price for this property",
       "what range can you sell it for"
     ],
     "do you have a buyer": [

@@ -90,12 +90,15 @@ class ConversationSession:
         normalized = normalize_text(utterance).strip(".,!? ")
         match_text = normalize_match_text(utterance)
         normalized_opening = normalize_match_text(self.opening)
-        explicit_affirmative = re.fullmatch(
-            r"(?:yes|yeah|yep|that's me|that is me|"
-            r"yes that's me|yes that is me)",
-            normalized,
+        explicit_affirmative = (
+            self._is_short_affirmative_confirmation(normalized)
+            or re.fullmatch(
+                r"(?:that's me|that is me|yes that's me|yes that is me)",
+                normalized,
+            )
+            is not None
         )
-        if explicit_affirmative is not None:
+        if explicit_affirmative:
             return "confirmed"
         if re.search(
             rf"(?:^|\s){re.escape(match_text)}(?:$|\s)",
@@ -485,9 +488,9 @@ class ConversationSession:
         )
 
     def _recipient_confirmed(self, text: str) -> bool:
-        if re.fullmatch(
+        if self._is_short_affirmative_confirmation(text) or re.fullmatch(
             r"(?:(?:yes|yeah|yep)[, ]*)?"
-            r"(?:speaking|that's me|that is me)|(?:yes|yeah|yep)",
+            r"(?:speaking|that's me|that is me)",
             text,
         ):
             return True
@@ -498,6 +501,13 @@ class ConversationSession:
         if identified_tokens is not None:
             return name_tokens == identified_tokens
         return self._name_only_confirmation(text, name_tokens)
+
+    @staticmethod
+    def _is_short_affirmative_confirmation(text: str) -> bool:
+        return re.fullmatch(
+            r"(?:yes|yeah|yep)(?:[, ]+(?:i|i'm|im|my|me|ah|uh|um))?",
+            text,
+        ) is not None
 
     def _recipient_denied(self, text: str) -> bool:
         if re.match(r"^(?:no|nope)\b", text) or text == "not me" or re.search(

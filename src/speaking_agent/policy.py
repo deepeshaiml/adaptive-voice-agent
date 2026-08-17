@@ -191,6 +191,8 @@ class ConversationPolicy:
         if field_name in {"expected_price", "expected_rent"}:
             field_specific_skip = re.search(
                 r"\bno\s+(?:specific\s+)?(?:range|figure|price|amount)\b|"
+                r"\b(?:don't|do not)\s+have\s+(?:a\s+)?(?:specific\s+)?"
+                r"(?:range|figure|price|amount)(?:\s+in\s+(?:my\s+)?mind)?\b|"
                 r"\b(?:don't|do not)\s+know\b.{0,30}"
                 r"\b(?:range|figure|price|amount)\b|"
                 r"\b(?:can|could)\s+you\s+(?:tell|give)\s+me\s+"
@@ -380,6 +382,13 @@ class ConversationPolicy:
                 updates["availability_date"] = timeline
 
         last_field = state.last_asked_field
+        if last_field in {"expected_price", "expected_rent"}:
+            monetary_value = self._extract_monetary_value(normalized_utterance)
+            if monetary_value is not None and not self._phrase_is_negated(
+                normalized_utterance,
+                monetary_value,
+            ):
+                updates[last_field] = monetary_value
         if last_field and self.campaign.field_types.get(last_field) == "boolean":
             boolean_answer = normalize_match_text(utterance)
             boolean_answer = re.sub(
@@ -409,6 +418,28 @@ class ConversationPolicy:
             ):
                 updates["currently_listed"] = True
         return updates
+
+    @staticmethod
+    def _extract_monetary_value(utterance: str) -> str | None:
+        number = (
+            r"(?:\d[\d,]*(?:\.\d+)?|"
+            r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+            r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+            r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)"
+            r"(?:\s+(?:one|two|three|four|five|six|seven|eight|nine))?"
+            r"(?:\s+point\s+(?:zero|one|two|three|four|five|six|seven|eight|nine))?)"
+        )
+        amount = rf"{number}(?:\s+(?:to|-)\s+{number})?"
+        currency = r"(?:aed|dirhams?|dhs?)"
+        magnitude = r"(?:hundred|thousand|million|billion|[km])"
+        match = re.search(
+            rf"\b(?:{currency}\s+{amount}(?:\s*{magnitude})?|"
+            rf"{amount}(?:\s*{magnitude}(?:\s+{currency})?|\s+{currency}))\b",
+            utterance,
+        )
+        if match is None:
+            return None
+        return re.sub(r"\baed\b", "AED", match.group(0), flags=re.IGNORECASE)
 
     def validated_outcome(
         self,

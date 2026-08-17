@@ -261,6 +261,24 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_reply.action, SessionAction.HANG_UP)
         self.assertEqual(session.result().outcome, "UNKNOWN")
 
+    async def test_clipped_affirmative_confirms_after_recognition_noise(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+            context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+        )
+        session.start()
+
+        retry = await session.receive("AED")
+        property_prompt = await session.receive("Yeah, my.")
+
+        self.assertIn("am I speaking with Mr. Ahmed", retry.text)
+        self.assertIn("Marina Gate", property_prompt.text)
+        self.assertFalse(session.state.ended)
+
     def test_confirmation_noise_classifier_is_conservative(self) -> None:
         session = ConversationSession(
             self.campaign,
@@ -296,7 +314,7 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     "noise",
                 )
-        for explicit in ("Yes", "Yeah", "That's me"):
+        for explicit in ("Yes", "Yeah", "Yeah, my", "That's me"):
             with self.subTest(explicit=explicit):
                 self.assertEqual(
                     session.classify_recipient_confirmation_overlap(explicit),
@@ -1054,6 +1072,69 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("expected_price", session.state.skipped_fields)
         self.assertEqual(session.state.unclear_turns, 0)
         self.assertIsNone(reply.question_field)
+
+    async def test_going_price_question_skips_price_without_repeating_it(self) -> None:
+        class FailingModel:
+            async def interpret(self, utterance, state, campaign):
+                del utterance, state, campaign
+                raise AssertionError("Known valuation FAQ should bypass Qwen")
+
+        session = ConversationSession(self.campaign, FailingModel())
+        session.start()
+        session.policy.apply_outcome(session.state, "SELL")
+        session.state.last_asked_field = "expected_price"
+
+        reply = await session.receive(
+            "I don't have a price in my mind. Can you suggest me what are the "
+            "price going on for this property?"
+        )
+
+        self.assertIn("don't have a live valuation", reply.text.casefold())
+        self.assertIn("expected_price", session.state.skipped_fields)
+        self.assertNotEqual(reply.question_field, "expected_price")
+
+    async def test_spoken_aed_price_is_extracted_without_model_update(self) -> None:
+        class EmptyModel:
+            async def interpret(self, utterance, state, campaign):
+                del utterance, state, campaign
+                return ModelInterpretation()
+
+        session = ConversationSession(self.campaign, EmptyModel())
+        session.start()
+        session.policy.apply_outcome(session.state, "SELL")
+        session.state.fields.update(
+            {
+                "property_location": "Dubai Marina",
+                "property_type": "apartment",
+                "selling_timeline": "next month",
+            }
+        )
+        session.state.skipped_fields.add("expected_price")
+        session.state.last_asked_field = "expected_price"
+
+        reply = await session.receive("So I am looking for two million AED.")
+
+        self.assertIn(
+            "two million",
+            session.state.fields["expected_price"].casefold(),
+        )
+        self.assertNotIn("expected_price", session.state.skipped_fields)
+        self.assertEqual(reply.question_field, "currently_listed")
+
+    async def test_negated_spoken_aed_price_is_not_extracted(self) -> None:
+        class EmptyModel:
+            async def interpret(self, utterance, state, campaign):
+                del utterance, state, campaign
+                return ModelInterpretation()
+
+        session = ConversationSession(self.campaign, EmptyModel())
+        session.start()
+        session.policy.apply_outcome(session.state, "SELL")
+        session.state.last_asked_field = "expected_price"
+
+        await session.receive("Not two million AED.")
+
+        self.assertNotIn("expected_price", session.state.fields)
 
     async def test_boolean_answer_with_fillers_is_grounded_once(self) -> None:
         session = ConversationSession(
