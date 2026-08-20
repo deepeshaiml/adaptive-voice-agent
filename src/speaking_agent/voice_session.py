@@ -150,6 +150,7 @@ class CallSession:
         self._confirmation_overlap_turn = False
         self._speech_in_progress = False
         self._pending_terminal_action: SessionAction | None = None
+        self._interrupted_terminal_reply: tuple[str, SessionAction] | None = None
         self._cleanup_errors: list[str] = []
 
     async def run(self) -> VoiceCallResult:
@@ -851,7 +852,14 @@ class CallSession:
             self.interruptions += 1
             self.trace.record(TimingEventName.INTERRUPTION)
             if self.conversation.state.ended and self._active_reply is not None:
-                self._deferred_reply = self._active_reply
+                terminal_reply = self._active_reply
+                terminal_key = (terminal_reply.text, terminal_reply.action)
+                if self._interrupted_terminal_reply == terminal_key:
+                    self._deferred_reply = None
+                    self._pending_terminal_action = terminal_reply.action
+                else:
+                    self._interrupted_terminal_reply = terminal_key
+                    self._deferred_reply = terminal_reply
         if self._active_reply is not None:
             self.conversation.mark_agent_reply_delivery(
                 self._active_reply.text,

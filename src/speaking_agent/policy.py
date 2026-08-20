@@ -398,7 +398,8 @@ class ConversationPolicy:
             )
             if re.fullmatch(
                 r"(?:no|nope|not yet|no it isn't|no it is not|"
-                r"no not yet|nope not yet)",
+                r"no not yet|nope not yet)|"
+                r"(?:no|nope)\s+not\s+(?!sure\b|certain\b)\w+",
                 boolean_answer,
             ):
                 updates[last_field] = False

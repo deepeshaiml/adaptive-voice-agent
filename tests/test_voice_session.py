@@ -2463,9 +2463,7 @@ class VoiceCallSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_terminal_interruptions_are_bounded(self) -> None:
         class SequencedRecognizer:
             def __init__(self) -> None:
-                self.responses = iter(
-                    ("not interested", "wait a moment", "wait a moment")
-                )
+                self.responses = iter(("not interested", "", ""))
 
             async def prepare(self):
                 return None

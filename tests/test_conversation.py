@@ -324,6 +324,14 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
             session.classify_recipient_confirmation_overlap("This is Ali"),
             "denied",
         )
+        self.assertEqual(
+            session.classify_recipient_confirmation_overlap("Yeah, this is Ali"),
+            "denied",
+        )
+        self.assertEqual(
+            session.classify_recipient_confirmation_overlap("Yeah, maybe"),
+            "unknown",
+        )
 
     async def test_personalized_confirmation_matches_ordered_unicode_name(self) -> None:
         cases = (
@@ -1190,6 +1198,17 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
                     utterance,
                 )
                 self.assertNotIn("currently_listed", updates)
+
+    async def test_short_corrupted_no_boolean_persists_false(self) -> None:
+        session = ConversationSession(self.campaign, MockConversationModel())
+        session.state.last_asked_field = "currently_listed"
+
+        updates = session.policy.deterministic_field_updates(
+            session.state,
+            "No, not dear.",
+        )
+
+        self.assertEqual(updates, {"currently_listed": False})
 
     async def test_ambiguous_sale_range_requires_full_aed_clarification(self) -> None:
         session = ConversationSession(
