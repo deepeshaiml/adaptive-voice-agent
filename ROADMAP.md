@@ -1,6 +1,6 @@
 # Optimization and Portability Roadmap
 
-Last updated: **2026-08-16**
+Last updated: **2026-08-20**
 
 Checklist meaning:
 
@@ -8,7 +8,7 @@ Checklist meaning:
 - `[ ]` is incomplete; partial foundations are described explicitly and must not be
       interpreted as platform support.
 
-Current validation baseline: **230 unit/scenario/adapter tests**, clean `pip check`,
+Current validation baseline: **256 unit/scenario/adapter tests**, clean `pip check`,
 clean bytecode compilation, clean `git diff --check`, resolved local Markdown links,
 and no editor diagnostics. A single warm local Qwen planning smoke completed in 1.214
 seconds. That number is useful as a regression signal only; repeatable P50/P95
@@ -37,13 +37,13 @@ platform does not yet imply supported or optimized inference.
 | Capability | Current progress | Primary ownership | Remaining work |
 |---|---|---|---|
 | Conversation core | Adaptive campaign flow, structured state, grounded fields, corrections, callbacks, transfers, and terminal outcomes are implemented | `conversation.py`, `policy.py`, `domain.py` | Recorded scenario benchmark and broader language/accent evidence |
-| Conversation memory | Bounded two-sided in-memory history tracks pending, interrupted, and delivered agent speech without persistence | `conversation.py`, `voice_session.py`, `domain.py` | Long-call quality benchmark and summarization only if measured need appears |
+| Conversation memory | Bounded prompt history plus campaign-gated retained full transcript tracks pending, interrupted, and delivered speech | `conversation.py`, `voice_session.py`, `domain.py` | Long-call quality benchmark and production access/encryption review |
 | Model planning | Sparse structured Qwen planning, relevant guidance selection, exact FAQ fast path, and 14,500-character prompt cap are implemented | `adapters/llm/qwen_mlx.py` | Stable-prefix caching, benchmark harness, larger/portable model comparison |
 | Safety/compliance | Deterministic DNC/callback/transfer precedence, field grounding, disclosure enforcement, and identity-claim filtering are implemented | `campaign.py`, `policy.py`, `text_safety.py` | Authoritative jurisdiction review and continuing adversarial paraphrase tests |
 | Speech | Local Qwen ASR/TTS, campaign vocabulary, campaign voice style, short utterances, cancellation, and WAV diagnostics are implemented | `speech.py`, `adapters/asr/`, `adapters/tts/`, `delivery.py` | Incremental ASR input, semantic endpointing, broader language/voice evaluation |
 | Local audio | Half duplex, speaker mode, and experimental full duplex with barge-in/output-reference echo suppression are implemented | `local_voice_chat.py`, `turn_detection.py`, `adapters/telephony/sounddevice_local.py` | Production AEC/noise suppression/VAD and measured room/device matrix |
 | LiveKit/SIP | Bidirectional room audio and controlled outbound dispatch are implemented | `livekit_worker.py`, `adapters/telephony/livekit_room.py`, `call_cli.py` | Real controlled PSTN call, trunk-specific transfer, voicemail, and failure evidence |
-| Persistence/privacy | SQLite WAL, atomic attempt reservation, keyed suppression, retention, structured records, and metrics are implemented | `adapters/storage/sqlite.py`, `suppression.py`, `recording.py`, `metrics.py` | Production database adapter only when concurrency/deployment measurements require it |
+| Persistence/privacy | SQLite WAL, atomic attempts, keyed suppression, retained summaries/transcripts, recording references, and expiry are implemented | `adapters/storage/sqlite.py`, `suppression.py`, `recording.py`, `metrics.py` | Encryption, role-based transcript access, and production database only when deployment requires them |
 | Portability | Application protocols and core are portable | `model.py`, `speech.py`, `transport.py`, repository interfaces | Runtime profile selection and native non-Apple inference/audio validation |
 
 ## Definition of Supported
@@ -128,8 +128,8 @@ Keep application protocols unchanged and select adapters through one composition
 
 ## P4: Conversational Intelligence and Naturalness
 
-- [x] Provide bounded, in-memory two-sided dialogue history and structured call state to
-      the conversation model without persisting transcripts.
+- [x] Provide bounded two-sided prompt history and campaign-gated full transcript
+      persistence under the structured-record retention horizon.
 - [x] Add a structured response planner/realizer contract that can vary transitions and phrasing
       while application policy still owns hard stops, fields, and the next objective.
 - [x] Track whether planned agent speech is pending, interrupted, or delivered so later
@@ -150,8 +150,12 @@ Keep application protocols unchanged and select adapters through one composition
       queue meaningful overlap, ignore low-information echo transcripts, and bound retries.
 - [x] Defer terminal hangup only for already-started microphone activity so sub-threshold
       late do-not-contact speech can mature, complete, and persist before teardown.
-- [x] Cover common property-owner scenarios with conditional guidance and safe approved
-      responses without inventing buyer, WhatsApp, transaction, or valuation tools.
+- [x] Cover DAMAC seller qualification with conditional WhatsApp/document collection,
+      approved comparable-data lookup, P1-P4 follow-up, and grounded no-invention rules.
+- [x] Persist a mandatory structured seller summary and expose a CRM/Yasir webhook with
+      transient WhatsApp links, future tasks, transcript, and recording references.
+- [x] Add loopback-only fictional market/lead services and a one-command synthetic seller
+      flow, with explicit demo provenance and refusal outside controlled-test campaigns.
 - [x] Support validated in-memory recipient/property metadata with an optional disclosed
       recipient-confirmation, timing-permission, and qualification preamble; preserve the
       generic opening when metadata is absent.

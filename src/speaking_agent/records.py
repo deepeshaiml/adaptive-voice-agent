@@ -33,6 +33,11 @@ class CallRecord:
     fields: dict[str, Any] = field(default_factory=dict)
     callback_requested: bool = False
     human_followup_required: bool = False
+    priority: str | None = None
+    follow_up_at: str | None = None
+    sales_summary: dict[str, Any] = field(default_factory=dict)
+    transcript: tuple[dict[str, str], ...] = ()
+    recording_url: str | None = None
     answer_kind: str | None = None
     phone_number_masked: str | None = None
     interruptions: int = 0

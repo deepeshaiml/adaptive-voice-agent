@@ -1,16 +1,23 @@
 from array import array
 import asyncio
+import os
 from pathlib import Path
 import time
 import unittest
+from unittest.mock import patch
 
-from speaking_agent.domain import AgentReply
+from speaking_agent.campaign import load_campaign
+from speaking_agent.domain import AgentReply, LeadOutcome
 from speaking_agent.delivery import campaign_voice_style
 from speaking_agent.local_voice_chat import (
     _audio_recorder,
     _check_audio_settings,
     _conversation_context,
     _device,
+    _lead_workflow_sink,
+    _local_phone_number,
+    _market_data_provider,
+    _publish_local_lead,
     _record_utterance,
     _recording_error,
     _speak,
@@ -105,6 +112,86 @@ class ContextRecognizer:
 
 
 class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_demo_call_publishes_yasir_event(self) -> None:
+        class Sink:
+            event = None
+
+            async def publish(self, event) -> None:
+                self.event = event
+
+        args = parse_args(["--demo-metadata"])
+        campaign = load_campaign(args.campaign)
+        sink = Sink()
+        lead = LeadOutcome(
+            outcome="SELL",
+            qualified=True,
+            summary="Demo seller.",
+            fields={
+                "selling_intention": "selling now",
+                "project": "DAMAC Lagoons",
+                "cluster": "Nice",
+                "bedrooms": "4",
+                "property_type": "townhouse",
+                "whatsapp_permission": True,
+                "whatsapp_number_confirmed": True,
+            },
+            callback_requested=False,
+            human_followup_required=True,
+            transcript=(
+                {"role": "owner", "text": "This is a fake seller call."},
+            ),
+        )
+
+        published = await _publish_local_lead(
+            args,
+            sink=sink,
+            campaign=campaign,
+            context=_conversation_context(args, campaign),
+            lead=lead,
+            call_id="local-demo-call",
+            duration_seconds=12.5,
+        )
+
+        self.assertTrue(published)
+        self.assertEqual(sink.event.call_id, "local-demo-call")
+        payload = sink.event.payload()
+        self.assertTrue(payload["notify_yasir"])
+        self.assertIn("wa.me/971500000000", payload["open_whatsapp_url"])
+
+    async def test_unqualified_demo_call_is_stored_without_yasir_notification(
+        self,
+    ) -> None:
+        class Sink:
+            event = None
+
+            async def publish(self, event) -> None:
+                self.event = event
+
+        args = parse_args(["--demo-metadata"])
+        campaign = load_campaign(args.campaign)
+        sink = Sink()
+        lead = LeadOutcome(
+            outcome="UNKNOWN",
+            qualified=False,
+            summary="Unqualified demo.",
+            fields={"intent": "UNKNOWN"},
+            callback_requested=False,
+            human_followup_required=False,
+        )
+
+        published = await _publish_local_lead(
+            args,
+            sink=sink,
+            campaign=campaign,
+            context=_conversation_context(args, campaign),
+            lead=lead,
+            call_id="local-unknown-call",
+            duration_seconds=4.0,
+        )
+
+        self.assertTrue(published)
+        self.assertFalse(sink.event.payload()["notify_yasir"])
+
     async def test_half_duplex_transcription_receives_campaign_context(self) -> None:
         from speaking_agent.local_voice_chat import _transcribe
 
@@ -174,11 +261,26 @@ class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(defaults.tts_top_k, 50)
 
     def test_demo_and_explicit_metadata_build_in_memory_context(self) -> None:
-        demo = _conversation_context(parse_args(["--demo-metadata"]))
+        demo_args = parse_args(["--demo-metadata"])
+        demo = _conversation_context(demo_args)
 
         self.assertEqual(demo.recipient_name, "Mr. Ahmed")
-        self.assertIn("Marina Gate", demo.property_reference)
-        self.assertEqual(demo.known_fields["property_location"], "Dubai Marina")
+        self.assertIn("DAMAC Lagoons", demo.property_reference)
+        self.assertEqual(demo.known_fields["cluster"], "Nice")
+        self.assertEqual(_local_phone_number(demo_args), "+971500000000")
+
+        with patch.dict(os.environ, {}, clear=True):
+            market_provider = _market_data_provider(demo_args)
+            lead_sink = _lead_workflow_sink(demo_args)
+
+        self.assertEqual(
+            market_provider.endpoint,
+            "http://127.0.0.1:8765/comparables",
+        )
+        self.assertEqual(
+            lead_sink.endpoint,
+            "http://127.0.0.1:8766/events",
+        )
 
         explicit = _conversation_context(
             parse_args(
@@ -186,17 +288,21 @@ class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
                     "--recipient-name",
                     "Ms. Fatima",
                     "--property-reference",
-                    "your villa in Dubai Hills",
-                    "--property-location",
-                    "Dubai Hills Estate",
+                    "your townhouse in Malta, DAMAC Lagoons",
+                    "--project",
+                    "DAMAC Lagoons",
+                    "--cluster",
+                    "Malta",
+                    "--bedrooms",
+                    "4",
                     "--property-type",
-                    "villa",
+                    "townhouse",
                 ]
             )
         )
 
         self.assertEqual(explicit.recipient_name, "Ms. Fatima")
-        self.assertEqual(explicit.known_fields["property_type"], "villa")
+        self.assertEqual(explicit.known_fields["property_type"], "townhouse")
 
         with self.assertRaises(SystemExit):
             parse_args(["--recipient-name", "Mr. Ahmed"])
@@ -210,6 +316,10 @@ class LocalVoiceChatTests(unittest.IsolatedAsyncioTestCase):
                     "Marina Gate",
                 ]
             )
+        with self.assertRaises(SystemExit):
+            parse_args(["--demo-metadata", "--phone-number", "+971501234567"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--phone-number", "0501234567"])
 
     def test_audio_recording_requires_full_duplex_and_consent_reference(self) -> None:
         with self.assertRaises(SystemExit):

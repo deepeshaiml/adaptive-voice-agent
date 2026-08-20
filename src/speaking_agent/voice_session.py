@@ -13,6 +13,7 @@ from speaking_agent.campaign import Campaign
 from speaking_agent.conversation import ConversationSession
 from speaking_agent.domain import AgentReply, LeadOutcome, SessionAction
 from speaking_agent.domain import ConversationContext
+from speaking_agent.market_data import MarketDataProvider
 from speaking_agent.model import ConversationModel
 from speaking_agent.observability import LatencyTrace, TimingEventName
 from speaking_agent.speech import (
@@ -93,12 +94,14 @@ class CallSession:
         transfer_available: bool = True,
         conversation_context: ConversationContext | None = None,
         audio_recorder: ConversationAudioRecorder | None = None,
+        market_data_provider: MarketDataProvider | None = None,
     ) -> None:
         self.conversation = ConversationSession(
             campaign,
             model,
             delivery_tracking=True,
             context=conversation_context,
+            market_data_provider=market_data_provider,
         )
         self.model = model
         self.recognizer = recognizer

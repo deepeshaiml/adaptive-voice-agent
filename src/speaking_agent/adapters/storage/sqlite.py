@@ -150,6 +150,11 @@ class SQLiteCallRepository:
                     fields_json TEXT NOT NULL,
                     callback_requested INTEGER NOT NULL,
                     human_followup_required INTEGER NOT NULL,
+                    priority TEXT,
+                    follow_up_at TEXT,
+                    sales_summary_json TEXT NOT NULL DEFAULT '{}',
+                    transcript_json TEXT NOT NULL DEFAULT '[]',
+                    recording_url TEXT,
                     answer_kind TEXT,
                     phone_number_masked TEXT,
                     interruptions INTEGER NOT NULL,
@@ -194,6 +199,17 @@ class SQLiteCallRepository:
                     ADD COLUMN disconnected INTEGER NOT NULL DEFAULT 0
                     """
                 )
+            for name, declaration in (
+                ("priority", "TEXT"),
+                ("follow_up_at", "TEXT"),
+                ("sales_summary_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("transcript_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("recording_url", "TEXT"),
+            ):
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE call_records ADD COLUMN {name} {declaration}"
+                    )
             if "expires_at" not in columns:
                 connection.execute(
                     "ALTER TABLE call_records ADD COLUMN expires_at TEXT"
@@ -280,6 +296,11 @@ class SQLiteCallRepository:
             json.dumps(record.fields, sort_keys=True),
             int(record.callback_requested),
             int(record.human_followup_required),
+            record.priority,
+            record.follow_up_at,
+            json.dumps(record.sales_summary, sort_keys=True),
+            json.dumps(record.transcript, sort_keys=True),
+            record.recording_url,
             record.answer_kind,
             record.phone_number_masked,
             record.interruptions,
@@ -296,10 +317,12 @@ class SQLiteCallRepository:
                 INSERT INTO call_records (
                     call_id, session_id, campaign_id, connection_result,
                     outcome, qualified, summary, fields_json,
-                    callback_requested, human_followup_required, answer_kind,
+                    callback_requested, human_followup_required, priority,
+                    follow_up_at, sales_summary_json, transcript_json,
+                    recording_url, answer_kind,
                     phone_number_masked, interruptions, disconnected, duration_seconds,
                     latencies_json, completed_at, expires_at, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(call_id) DO UPDATE SET
                     connection_result=excluded.connection_result,
                     outcome=excluded.outcome,
@@ -308,6 +331,11 @@ class SQLiteCallRepository:
                     fields_json=excluded.fields_json,
                     callback_requested=excluded.callback_requested,
                     human_followup_required=excluded.human_followup_required,
+                    priority=excluded.priority,
+                    follow_up_at=excluded.follow_up_at,
+                    sales_summary_json=excluded.sales_summary_json,
+                    transcript_json=excluded.transcript_json,
+                    recording_url=excluded.recording_url,
                     answer_kind=excluded.answer_kind,
                     phone_number_masked=excluded.phone_number_masked,
                     interruptions=excluded.interruptions,
@@ -493,6 +521,11 @@ class SQLiteCallRepository:
             fields=json.loads(values["fields_json"]),
             callback_requested=bool(values["callback_requested"]),
             human_followup_required=bool(values["human_followup_required"]),
+            priority=values["priority"],
+            follow_up_at=values["follow_up_at"],
+            sales_summary=json.loads(values["sales_summary_json"]),
+            transcript=tuple(json.loads(values["transcript_json"])),
+            recording_url=values["recording_url"],
             answer_kind=values["answer_kind"],
             phone_number_masked=values["phone_number_masked"],
             interruptions=values["interruptions"],

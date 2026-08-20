@@ -72,6 +72,9 @@ class ConversationState:
     fields: dict[str, Any] = field(default_factory=dict)
     recent_owner_utterances: list[str] = field(default_factory=list)
     recent_dialogue: list[dict[str, str]] = field(default_factory=list)
+    transcript: list[dict[str, str]] = field(default_factory=list)
+    market_context: dict[str, Any] | None = None
+    market_feedback_discussed: bool = False
     skipped_fields: set[str] = field(default_factory=set)
     asked_fields: set[str] = field(default_factory=set)
     asked_field_counts: dict[str, int] = field(default_factory=dict)
@@ -99,3 +102,6 @@ class LeadOutcome:
     fields: dict[str, Any]
     callback_requested: bool
     human_followup_required: bool
+    market_data: dict[str, Any] | None = None
+    market_feedback_discussed: bool = False
+    transcript: tuple[dict[str, str], ...] = ()

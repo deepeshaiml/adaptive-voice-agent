@@ -16,6 +16,11 @@ from speaking_agent.domain import (
     LeadOutcome,
     SessionAction,
 )
+from speaking_agent.market_data import (
+    ComparableProperty,
+    MarketDataError,
+    MarketDataProvider,
+)
 from speaking_agent.model import ConversationModel, ConversationModelError
 from speaking_agent.policy import ConversationPolicy
 from speaking_agent.text_safety import normalize_match_text, normalize_text
@@ -31,6 +36,7 @@ class ConversationSession:
         session_id: str | None = None,
         delivery_tracking: bool = False,
         context: ConversationContext | None = None,
+        market_data_provider: MarketDataProvider | None = None,
     ) -> None:
         self.campaign = campaign
         self.model = model
@@ -41,6 +47,8 @@ class ConversationSession:
             campaign_id=campaign.campaign_id,
         )
         self.context = context or ConversationContext()
+        self._market_data_provider = market_data_provider
+        self._market_lookup_key: tuple[str, str, str, str] | None = None
         if self.context.recipient_name and not campaign.personalized_preamble:
             raise ValueError(
                 "Campaign does not configure a personalized preamble"
@@ -78,10 +86,14 @@ class ConversationSession:
 
     def classify_recipient_confirmation(self, utterance: str) -> str:
         normalized = normalize_text(utterance).strip(".,!? ")
-        if self._recipient_denied(normalized):
+        if re.match(r"^(?:no|nope)\b", normalized):
             return "denied"
         if self._recipient_confirmed(normalized):
             return "confirmed"
+        if self._recipient_denied(normalized):
+            return "denied"
+        if normalized in {"okay", "ok", "alright", "sure"}:
+            return "acknowledgement"
         if self.policy.is_confirmation_noise(utterance):
             return "noise"
         return "unknown"
@@ -283,7 +295,8 @@ class ConversationSession:
             interpretation.acknowledgement,
             self.state.recent_dialogue,
         )
-        response_prefix = answer or acknowledgement
+        market_feedback = await self._market_feedback_if_ready()
+        response_prefix = market_feedback or answer or acknowledgement
         pending_field_answered = (
             pending_field is not None
             and self.state.fields.get(pending_field) not in (None, "")
@@ -343,7 +356,59 @@ class ConversationSession:
             human_followup_required=(
                 self.state.outcome in self.campaign.human_followup_outcomes
             ),
+            market_data=(
+                dict(self.state.market_context)
+                if self.state.market_context is not None
+                else None
+            ),
+            market_feedback_discussed=self.state.market_feedback_discussed,
+            transcript=tuple(dict(turn) for turn in self.state.transcript),
         )
+
+    async def _market_feedback_if_ready(self) -> str | None:
+        if self._market_data_provider is None:
+            return None
+        comparable_fields = (
+            self.state.fields.get("project"),
+            self.state.fields.get("cluster"),
+            self.state.fields.get("bedrooms"),
+            self.state.fields.get("property_type"),
+        )
+        if not all(isinstance(value, str) and value.strip() for value in comparable_fields):
+            return None
+        lookup_key = tuple(str(value).casefold() for value in comparable_fields)
+        if lookup_key == self._market_lookup_key:
+            return None
+        self._market_lookup_key = lookup_key
+        query = ComparableProperty(
+            project=str(comparable_fields[0]),
+            cluster=str(comparable_fields[1]),
+            bedrooms=str(comparable_fields[2]),
+            property_type=str(comparable_fields[3]),
+        )
+        try:
+            snapshot = await self._market_data_provider.get_comparables(query)
+        except MarketDataError:
+            self.state.market_context = {
+                "available": False,
+                "message": "Approved comparable data is temporarily unavailable.",
+            }
+            return None
+        if snapshot is None:
+            self.state.market_context = {
+                "available": False,
+                "message": "No sufficiently relevant approved comparables were found.",
+            }
+            return None
+        if snapshot.demo and not self.campaign.behavior["controlled_test_mode"]:
+            self.state.market_context = {
+                "available": False,
+                "message": "Demo market evidence is disabled outside controlled tests.",
+            }
+            return None
+        self.state.market_context = snapshot.prompt_context()
+        self.state.market_feedback_discussed = True
+        return snapshot.spoken_feedback()
 
     def abort(self, outcome: str | None = None) -> None:
         if not self.state.ended:
@@ -407,6 +472,16 @@ class ConversationSession:
             maximum_attempts = int(
                 self.campaign.behavior.get("max_unclear_retries", 2)
             )
+            if classification == "acknowledgement":
+                self._recipient_confirmation_attempts += 1
+                if self._recipient_confirmation_attempts > maximum_attempts:
+                    return self._finish("UNKNOWN")
+                return self._remember_agent_reply(
+                    AgentReply(
+                        "For privacy, please say yes if you are "
+                        f"{self.context.recipient_name}, or no if I have the wrong person."
+                    )
+                )
             if classification == "noise":
                 terminal_reply = self.register_recipient_confirmation_noise()
                 if terminal_reply is not None:
@@ -679,6 +754,7 @@ class ConversationSession:
             turn["delivery"] = delivery
         if question_field is not None:
             turn["question_field"] = question_field
+        self.state.transcript.append(turn)
         self.state.recent_dialogue.append(turn)
         memory_turns = int(
             self.campaign.behavior.get("conversation_memory_turns", 12)

@@ -4,7 +4,6 @@ import json
 from dataclasses import dataclass, field
 from string import Formatter
 from pathlib import Path
-import re
 from typing import Any
 
 from speaking_agent.text_safety import (
@@ -30,6 +29,7 @@ class Campaign:
     field_types: dict[str, str]
     field_allowed_values: dict[str, tuple[str, ...]]
     field_extraction_hints: dict[str, tuple[str, ...]]
+    field_dependencies: dict[str, dict[str, Any]]
     questions: dict[str, str]
     terminal_outcomes: tuple[str, ...]
     closing_messages: dict[str, str]
@@ -289,6 +289,42 @@ class Campaign:
             name: tuple(value.strip() for value in values)
             for name, values in raw_field_extraction_hints.items()
         }
+        raw_field_dependencies = data.get("field_dependencies", {})
+        if not isinstance(raw_field_dependencies, dict):
+            raise ValueError("Campaign field_dependencies must be an object")
+        invalid_dependencies = []
+        for target, dependency in raw_field_dependencies.items():
+            if (
+                target not in configured_fields
+                or not isinstance(dependency, dict)
+                or set(dependency) != {"field", "equals"}
+                or dependency.get("field") not in configured_fields
+                or dependency.get("field") == target
+            ):
+                invalid_dependencies.append(target)
+                continue
+            source_type = field_types[dependency["field"]]
+            expected = dependency["equals"]
+            type_matches = (
+                (source_type == "string" and isinstance(expected, str))
+                or (source_type == "boolean" and isinstance(expected, bool))
+                or (
+                    source_type == "number"
+                    and isinstance(expected, (int, float))
+                    and not isinstance(expected, bool)
+                )
+            )
+            if not type_matches:
+                invalid_dependencies.append(target)
+        if invalid_dependencies:
+            raise ValueError(
+                "Campaign field dependencies are invalid for fields: "
+                + ", ".join(sorted(invalid_dependencies))
+            )
+        field_dependencies = {
+            target: dict(dependency)
+            for target, dependency in raw_field_dependencies.items()
+        }
 
         missing_questions = configured_fields - data["questions"].keys()
         if missing_questions:
@@ -438,6 +474,10 @@ class Campaign:
         controlled_test_mode = behavior.get("controlled_test_mode")
         if not isinstance(controlled_test_mode, bool):
             raise ValueError("Campaign behavior.controlled_test_mode must be a boolean")
+        transcript_enabled = behavior.get("transcript_enabled", False)
+        if not isinstance(transcript_enabled, bool):
+            raise ValueError("Campaign behavior.transcript_enabled must be a boolean")
+        behavior["transcript_enabled"] = transcript_enabled
         for key in ("campaign_enabled", "recording_enabled"):
             if not isinstance(behavior.get(key), bool):
                 raise ValueError(f"Campaign behavior.{key} must be a boolean")
@@ -737,6 +777,7 @@ class Campaign:
             field_types=field_types,
             field_allowed_values=field_allowed_values,
             field_extraction_hints=field_extraction_hints,
+            field_dependencies=field_dependencies,
             questions=dict(data["questions"]),
             terminal_outcomes=terminal_outcomes,
             closing_messages=closing_messages,

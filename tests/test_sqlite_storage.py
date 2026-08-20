@@ -34,6 +34,13 @@ class SQLiteCallRepositoryTests(unittest.IsolatedAsyncioTestCase):
                 qualified=True,
                 summary="Owner may sell.",
                 fields={"intent": "SELL", "currently_listed": False},
+                priority="PRIORITY_1_HOT",
+                follow_up_at="2026-08-20T12:00:00+00:00",
+                sales_summary={"priority": "PRIORITY_1_HOT"},
+                transcript=(
+                    {"role": "owner", "text": "I am selling now."},
+                ),
+                recording_url="https://recordings.example.test/call-1",
                 phone_number_masked="***0123",
                 latencies={"speech_end_to_playback": 0.42},
             )

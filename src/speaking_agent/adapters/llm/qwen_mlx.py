@@ -133,7 +133,9 @@ class QwenMlxConversationModel:
             "answers to last_asked_field. Classification and extraction are independent. "
             "Do not infer SELL, RENT, or SELL_OR_RENT from generic interest, yes, or maybe. "
             "Do not store placeholders such as my address, there, something else, or not "
-            "sure. Never invent facts. Never ignore a direct question: answer it in one or "
+            "sure. Never invent facts. Market data may be used only when market_data is "
+            "present and available; always distinguish actual registered transactions "
+            "from current asking listings. Never ignore a direct question: answer it in one or "
             "two brief natural statements using relevant FAQ facts or safe general "
             "knowledge, and state limits plainly. acknowledgement is a short optional "
             "statement, never a substitute for extraction. If continuing, propose exactly "
@@ -173,6 +175,7 @@ class QwenMlxConversationModel:
                 "field_types": campaign.field_types,
                 "field_allowed_values": campaign.field_allowed_values,
                 "field_extraction_hints": campaign.field_extraction_hints,
+                "field_dependencies": campaign.field_dependencies,
                 "questions": campaign.questions,
                 "relevant_faq_answers": cls._relevant_faq_answers(
                     utterance,
@@ -189,6 +192,7 @@ class QwenMlxConversationModel:
                 "last_asked_field": state.last_asked_field,
                 "asked_field_counts": dict(state.asked_field_counts),
                 "callback_requested": state.callback_requested,
+                "market_data": state.market_context,
                 "recent_dialogue": [dict(turn) for turn in state.recent_dialogue],
             },
             "latest_owner_utterance": utterance,

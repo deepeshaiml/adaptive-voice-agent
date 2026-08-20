@@ -279,6 +279,26 @@ class ConversationScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Marina Gate", property_prompt.text)
         self.assertFalse(session.state.ended)
 
+    async def test_recipient_acknowledgement_requests_explicit_identity(self) -> None:
+        session = ConversationSession(
+            self.campaign,
+            MockConversationModel(),
+            context=ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your apartment in Marina Gate",
+            ),
+        )
+        session.start()
+
+        first = await session.receive("Okay")
+        second = await session.receive("Okay")
+
+        self.assertFalse(session.state.ended)
+        self.assertIn("please say yes", first.text.casefold())
+        self.assertIn("wrong person", second.text.casefold())
+        confirmed = await session.receive("Yes, speaking")
+        self.assertIn("Marina Gate", confirmed.text)
+
     def test_confirmation_noise_classifier_is_conservative(self) -> None:
         session = ConversationSession(
             self.campaign,

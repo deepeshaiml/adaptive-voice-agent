@@ -47,7 +47,7 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--campaign",
         type=Path,
-        default=Path("campaigns/property_owner.json"),
+        default=Path("campaigns/neoai_property_owner.json"),
         help="Path to a campaign JSON file",
     )
     parser.add_argument(

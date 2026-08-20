@@ -188,7 +188,12 @@ class ConversationPolicy:
             normalized_match,
         )
         field_specific_skip = False
-        if field_name in {"expected_price", "expected_rent"}:
+        if field_name in {
+            "expected_price",
+            "expected_rent",
+            "asking_price",
+            "minimum_price",
+        }:
             field_specific_skip = re.search(
                 r"\bno\s+(?:specific\s+)?(?:range|figure|price|amount)\b|"
                 r"\b(?:don't|do not)\s+have\s+(?:a\s+)?(?:specific\s+)?"
@@ -367,6 +372,11 @@ class ConversationPolicy:
             ):
                 updates[field_name] = matches[0]
 
+        if "selling_intention" in self.campaign.questions:
+            selling_intention = self._selling_intention(normalized_utterance)
+            if selling_intention is not None:
+                updates["selling_intention"] = selling_intention
+
         timeline_match = re.search(
             r"\b(?:(?:next|this)\s+(?:week|month|year)|"
             r"(?:in|within)\s+(?:about\s+)?(?:\d+|one|two|three|four|five|six)\s+"
@@ -382,7 +392,12 @@ class ConversationPolicy:
                 updates["availability_date"] = timeline
 
         last_field = state.last_asked_field
-        if last_field in {"expected_price", "expected_rent"}:
+        if last_field in {
+            "expected_price",
+            "expected_rent",
+            "asking_price",
+            "minimum_price",
+        }:
             monetary_value = self._extract_monetary_value(normalized_utterance)
             if monetary_value is not None and not self._phrase_is_negated(
                 normalized_utterance,
@@ -419,6 +434,43 @@ class ConversationPolicy:
             ):
                 updates["currently_listed"] = True
         return updates
+
+    @staticmethod
+    def _selling_intention(utterance: str) -> str | None:
+        right_price = re.search(
+            r"\b(?:right|good|acceptable|realistic) price\b|"
+            r"\b(?:sell|selling)\b.{0,35}\b(?:if|provided|assuming)\b.{0,35}"
+            r"\b(?:price|offer|amount)\b|"
+            r"\b(?:would|might|could) sell\b.{0,30}\b(?:for|if)\b",
+            utterance,
+        )
+        if right_price is not None:
+            return "open to selling at the right price"
+        selling_later = re.search(
+            r"\b(?:sell|selling)\b.{0,40}\b(?:later|after handover|"
+            r"in (?:a few|\d+|one|two|three|four|five|six|twelve) "
+            r"(?:months?|years?))\b|"
+            r"\b(?:later|after handover)\b.{0,30}\b(?:sell|selling)\b",
+            utterance,
+        )
+        if selling_later is not None:
+            return "selling later"
+        holding = re.search(
+            r"\b(?:hold|holding|keep|keeping)\b.{0,30}\b(?:long term|"
+            r"for the long term|for now|property|it)\b|"
+            r"\b(?:not planning|no plans|don't plan|do not plan)\b.{0,20}"
+            r"\b(?:sell|selling)\b",
+            utterance,
+        )
+        if holding is not None:
+            return "holding long term"
+        if re.search(
+            r"\b(?:ready|want|looking|planning|trying) to sell\b|"
+            r"\b(?:selling now|sell now|put (?:it|the property) on the market)\b",
+            utterance,
+        ):
+            return "selling now"
+        return None
 
     @staticmethod
     def _extract_monetary_value(utterance: str) -> str | None:
@@ -631,6 +683,7 @@ class ConversationPolicy:
                 field_name
                 for field_name in fields
                 if field_name not in state.skipped_fields
+                and self._field_dependency_satisfied(state, field_name)
                 and (
                     field_name not in state.fields
                     or state.fields[field_name] in (None, "")
@@ -638,6 +691,16 @@ class ConversationPolicy:
             ),
             None,
         )
+
+    def _field_dependency_satisfied(
+        self,
+        state: ConversationState,
+        field_name: str,
+    ) -> bool:
+        dependency = self.campaign.field_dependencies.get(field_name)
+        if dependency is None:
+            return True
+        return state.fields.get(dependency["field"]) == dependency["equals"]
 
     def safe_answer(self, answer: str | None) -> str | None:
         if not answer:
@@ -810,6 +873,20 @@ class ConversationPolicy:
                 "very good price",
                 "market price",
             },
+            "asking_price": {
+                "a good price",
+                "a very good price",
+                "good price",
+                "very good price",
+                "market price",
+            },
+            "minimum_price": {
+                "a good price",
+                "a very good price",
+                "good price",
+                "very good price",
+                "market price",
+            },
             "expected_rent": {
                 "a good rent",
                 "good rent",
@@ -825,18 +902,23 @@ class ConversationPolicy:
         if name in {"selling_timeline", "availability_date", "follow_up_date"}:
             if re.search(
                 r"\b(?:now|soon|immediately|today|tomorrow|next|this|"
-                r"days?|weeks?|months?|years?|as soon as possible)\b",
+                r"days?|weeks?|months?|years?|later|handover|as soon as possible)\b",
                 normalized_value,
             ) is None:
                 return False
-        if name in {"expected_price", "expected_rent"}:
+        if name in {
+            "expected_price",
+            "expected_rent",
+            "asking_price",
+            "minimum_price",
+        }:
             if re.search(
                 r"\b(?:\d|one|two|three|four|five|six|seven|eight|nine|ten|"
                 r"hundred|thousand|million|aed|dirhams?)\b",
                 normalized_value,
             ) is None:
                 return False
-        if name == "expected_price" and re.search(
+        if name in {"expected_price", "asking_price", "minimum_price"} and re.search(
             r"\b(?:aed|dirhams?|million|thousand|[0-9]+(?:\.[0-9]+)?\s*[km])\b",
             normalized_value,
         ) is None:

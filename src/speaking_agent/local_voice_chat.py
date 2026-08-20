@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import sys
 from threading import Event
@@ -29,10 +30,24 @@ from speaking_agent.adapters.tts.qwen_mlx import (
     DEFAULT_TTS_MODEL_PATH,
     QwenMlxSpeechSynthesizer,
 )
-from speaking_agent.campaign import load_campaign
+from speaking_agent.campaign import Campaign, load_campaign
 from speaking_agent.conversation import ConversationSession
 from speaking_agent.delivery import campaign_voice_style
-from speaking_agent.domain import AgentReply, ConversationContext, SessionAction
+from speaking_agent.domain import (
+    AgentReply,
+    ConversationContext,
+    LeadOutcome,
+    SessionAction,
+)
+from speaking_agent.lead_workflow import (
+    LeadDeliveryError,
+    LeadWorkflowEvent,
+    LeadWorkflowSink,
+    WebhookLeadWorkflowSink,
+    analyze_sales_call,
+)
+from speaking_agent.market_data import HttpMarketDataProvider, MarketDataProvider
+from speaking_agent.outbound import is_e164, mask_phone_number
 from speaking_agent.recording import latency_snapshot
 from speaking_agent.speech import AudioFrame, PcmFormat, SynthesisOptions
 from speaking_agent.turn_detection import (
@@ -41,6 +56,11 @@ from speaking_agent.turn_detection import (
     TurnEventKind,
 )
 from speaking_agent.voice_session import CallSession
+
+
+DEMO_MARKET_DATA_URL = "http://127.0.0.1:8765/comparables"
+DEMO_LEAD_WORKFLOW_URL = "http://127.0.0.1:8766/events"
+DEMO_PHONE_NUMBER = "+971500000000"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,8 +72,23 @@ class TurnMetrics:
     tts_playout_seconds: float
 
 
-def _conversation_context(args: argparse.Namespace) -> ConversationContext:
+def _conversation_context(
+    args: argparse.Namespace,
+    campaign: Campaign | None = None,
+) -> ConversationContext:
+    campaign = campaign or load_campaign(args.campaign)
     if args.demo_metadata:
+        if "project" in campaign.questions:
+            return ConversationContext(
+                recipient_name="Mr. Ahmed",
+                property_reference="your 4 bedroom townhouse in Nice, DAMAC Lagoons",
+                known_fields={
+                    "project": "DAMAC Lagoons",
+                    "cluster": "Nice",
+                    "bedrooms": "4",
+                    "property_type": "townhouse",
+                },
+            )
         return ConversationContext(
             recipient_name="Mr. Ahmed",
             property_reference="your apartment in Marina Gate, Dubai Marina",
@@ -65,10 +100,13 @@ def _conversation_context(args: argparse.Namespace) -> ConversationContext:
     known_fields = {
         name: value
         for name, value in (
+            ("project", args.project),
+            ("cluster", args.cluster),
+            ("bedrooms", args.bedrooms),
             ("property_location", args.property_location),
             ("property_type", args.property_type),
         )
-        if value is not None
+        if value is not None and name in campaign.questions
     }
     return ConversationContext(
         recipient_name=args.recipient_name,
@@ -84,6 +122,112 @@ def _audio_recorder(args: argparse.Namespace) -> WaveConversationRecorder | None
         args.recording_directory,
         RecordingConsent(args.recording_consent_reference),
     )
+
+
+def _market_data_provider(
+    args: argparse.Namespace,
+) -> MarketDataProvider | None:
+    endpoint = os.environ.get("SPEAKING_AGENT_MARKET_DATA_URL")
+    if endpoint is None and args.demo_metadata:
+        endpoint = DEMO_MARKET_DATA_URL
+    if endpoint is None:
+        return None
+    return HttpMarketDataProvider(
+        endpoint,
+        bearer_token=os.environ.get("SPEAKING_AGENT_MARKET_DATA_TOKEN"),
+        timeout_seconds=float(
+            os.environ.get("SPEAKING_AGENT_MARKET_DATA_TIMEOUT_SECONDS", "5")
+        ),
+    )
+
+
+def _lead_workflow_sink(
+    args: argparse.Namespace,
+) -> LeadWorkflowSink | None:
+    endpoint = os.environ.get("SPEAKING_AGENT_LEAD_WORKFLOW_URL")
+    if endpoint is None and args.demo_metadata:
+        endpoint = DEMO_LEAD_WORKFLOW_URL
+    if endpoint is None:
+        return None
+    return WebhookLeadWorkflowSink(
+        endpoint,
+        bearer_token=os.environ.get("SPEAKING_AGENT_LEAD_WORKFLOW_TOKEN"),
+        timeout_seconds=float(
+            os.environ.get("SPEAKING_AGENT_LEAD_WORKFLOW_TIMEOUT_SECONDS", "5")
+        ),
+    )
+
+
+def _local_phone_number(args: argparse.Namespace) -> str | None:
+    return DEMO_PHONE_NUMBER if args.demo_metadata else args.phone_number
+
+
+async def _publish_local_lead(
+    args: argparse.Namespace,
+    *,
+    sink: LeadWorkflowSink | None,
+    campaign: Campaign,
+    context: ConversationContext,
+    lead: LeadOutcome,
+    call_id: str,
+    duration_seconds: float,
+    recording_url: str | None = None,
+) -> bool:
+    if sink is None:
+        return False
+    phone_number = _local_phone_number(args)
+    analysis = analyze_sales_call(
+        outcome=lead.outcome,
+        fields=lead.fields,
+        transcript=lead.transcript,
+        owner_name=context.recipient_name,
+        phone_number_masked=(
+            mask_phone_number(phone_number) if phone_number is not None else None
+        ),
+        duration_seconds=duration_seconds,
+        market_data=lead.market_data,
+        market_feedback_discussed=lead.market_feedback_discussed,
+        recording_url=recording_url,
+    )
+    try:
+        await sink.publish(
+            LeadWorkflowEvent(
+                call_id=call_id,
+                campaign_id=campaign.campaign_id,
+                owner_name=context.recipient_name,
+                phone_number=phone_number,
+                phone_number_masked=(
+                    mask_phone_number(phone_number)
+                    if phone_number is not None
+                    else None
+                ),
+                analysis=analysis,
+                transcript=lead.transcript,
+                recording_url=recording_url,
+            )
+        )
+    except LeadDeliveryError as error:
+        print(f"Yasir notification failed: {error}", file=sys.stderr)
+        return False
+    if analysis.notification_mode.value == "NONE":
+        print(
+            "Call analysis stored: no Yasir notification required "
+            f"priority={analysis.priority.value} call_id={call_id}",
+            flush=True,
+        )
+    else:
+        print(
+            "Yasir notification sent: "
+            f"priority={analysis.priority.value} call_id={call_id}",
+            flush=True,
+        )
+    return True
+
+
+def _recording_url(recorder: WaveConversationRecorder | None) -> str | None:
+    if recorder is None or recorder.artifact is None:
+        return None
+    return recorder.artifact.audio_path.resolve().as_uri()
 
 
 def _recording_error(result: Any, recorder: WaveConversationRecorder) -> str | None:
@@ -322,6 +466,8 @@ async def _run_full_duplex(
         print(f"Agent: {reply.text}", flush=True)
 
     audio_recorder = _audio_recorder(args)
+    conversation_context = _conversation_context(args, campaign)
+    lead_workflow_sink = _lead_workflow_sink(args)
     session = CallSession(
         campaign=campaign,
         model=model,
@@ -338,11 +484,14 @@ async def _run_full_duplex(
         recognition_language=args.language,
         recognition_context=campaign.speech_recognition_context,
         transfer_available=False,
-        conversation_context=_conversation_context(args),
+        conversation_context=conversation_context,
         audio_recorder=audio_recorder,
+        market_data_provider=_market_data_provider(args),
     )
     print("Loading local Qwen LLM, ASR, and TTS models...", flush=True)
+    call_started_at = time.perf_counter()
     result = await session.run()
+    duration_seconds = time.perf_counter() - call_started_at
     print(
         "Session: "
         f"interruptions={result.interruptions} "
@@ -350,6 +499,16 @@ async def _run_full_duplex(
     )
     print("Result:")
     print(json.dumps(asdict(result.lead), indent=2))
+    await _publish_local_lead(
+        args,
+        sink=lead_workflow_sink,
+        campaign=campaign,
+        context=conversation_context,
+        lead=result.lead,
+        call_id=session.conversation.state.call_id,
+        duration_seconds=duration_seconds,
+        recording_url=_recording_url(audio_recorder),
+    )
     if audio_recorder is not None:
         recording_error = _recording_error(result, audio_recorder)
         if recording_error is not None:
@@ -362,7 +521,7 @@ async def _run_full_duplex(
 
 async def run(args: argparse.Namespace, audio: Any) -> int:
     campaign = load_campaign(args.campaign)
-    conversation_context = _conversation_context(args)
+    conversation_context = _conversation_context(args, campaign)
     voice_style = args.style or campaign_voice_style(campaign)
     model = QwenMlxConversationModel(
         MlxLmBackend(args.model_path or DEFAULT_MODEL_PATH)
@@ -378,7 +537,13 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
         temperature=args.tts_temperature,
         top_k=args.tts_top_k,
     )
-    session = ConversationSession(campaign, model, context=conversation_context)
+    lead_workflow_sink = _lead_workflow_sink(args)
+    session = ConversationSession(
+        campaign,
+        model,
+        context=conversation_context,
+        market_data_provider=_market_data_provider(args),
+    )
     input_device = _device(args.input_device)
     output_device = _device(args.output_device)
     turn_config = TurnDetectionConfig(
@@ -420,6 +585,7 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
         else:
             print("Ready. Use headphones for the clearest quality check.", flush=True)
 
+        call_started_at = time.perf_counter()
         opening = session.start()
         print(f"Agent: {opening.text}")
         await _speak(
@@ -499,8 +665,18 @@ async def run(args: argparse.Namespace, audio: Any) -> int:
                 f"speech end to response {metrics.response_first_audio_seconds:.2f}s"
             )
 
+        lead = session.result()
         print("Result:")
-        print(json.dumps(asdict(session.result()), indent=2))
+        print(json.dumps(asdict(lead), indent=2))
+        await _publish_local_lead(
+            args,
+            sink=lead_workflow_sink,
+            campaign=campaign,
+            context=conversation_context,
+            lead=lead,
+            call_id=session.state.call_id,
+            duration_seconds=time.perf_counter() - call_started_at,
+        )
         return 0
     finally:
         await synthesizer.close()
@@ -515,7 +691,7 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--campaign",
         type=Path,
-        default=Path("campaigns/property_owner.json"),
+        default=Path("campaigns/neoai_property_owner.json"),
     )
     parser.add_argument("--model-path")
     parser.add_argument("--asr-model-path")
@@ -541,10 +717,17 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--demo-metadata",
         action="store_true",
-        help="Use fake Mr. Ahmed and Marina Gate metadata for local testing",
+        help="Use fake Mr. Ahmed and DAMAC Lagoons metadata for local testing",
     )
     parser.add_argument("--recipient-name")
     parser.add_argument("--property-reference")
+    parser.add_argument(
+        "--phone-number",
+        help="Optional E.164 number included only in the configured local lead workflow",
+    )
+    parser.add_argument("--project")
+    parser.add_argument("--cluster")
+    parser.add_argument("--bedrooms")
     parser.add_argument("--property-location")
     parser.add_argument("--property-type")
     parser.add_argument(
@@ -621,6 +804,9 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         for name in (
             "recipient_name",
             "property_reference",
+            "project",
+            "cluster",
+            "bedrooms",
             "property_location",
             "property_type",
         )
@@ -631,6 +817,10 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(
             "--recipient-name and --property-reference must be provided together"
         )
+    if args.demo_metadata and args.phone_number is not None:
+        parser.error("--demo-metadata uses a fixed fake phone number")
+    if args.phone_number is not None and not is_e164(args.phone_number):
+        parser.error("--phone-number must use E.164 format")
     if args.record_audio and not args.full_duplex:
         parser.error("--record-audio currently requires --full-duplex")
     if args.record_audio and not args.recording_consent_reference:

@@ -19,6 +19,13 @@ from speaking_agent.answering import HeuristicAnsweringMachineDetector
 from speaking_agent.campaign import load_campaign
 from speaking_agent.delivery import campaign_voice_style
 from speaking_agent.domain import ConversationContext
+from speaking_agent.lead_workflow import (
+    LeadDeliveryError,
+    LeadWorkflowEvent,
+    SalesCallAnalysis,
+    WebhookLeadWorkflowSink,
+)
+from speaking_agent.market_data import HttpMarketDataProvider
 from speaking_agent.outbound import (
     DialStatus,
     LiveKitSipDialer,
@@ -47,7 +54,10 @@ server = AgentServer()
 @server.rtc_session(agent_name="speaking-agent")
 async def entrypoint(context: JobContext) -> None:
     campaign_path = Path(
-        os.environ.get("SPEAKING_AGENT_CAMPAIGN", "campaigns/property_owner.json")
+        os.environ.get(
+            "SPEAKING_AGENT_CAMPAIGN",
+            "campaigns/neoai_property_owner.json",
+        )
     )
 
     metadata = json.loads(context.job.metadata or "{}")
@@ -135,6 +145,30 @@ async def entrypoint(context: JobContext) -> None:
         transfer_handler=transfer if transfer_to else None,
     )
     campaign = load_campaign(campaign_path)
+    market_data_endpoint = os.environ.get("SPEAKING_AGENT_MARKET_DATA_URL")
+    market_data_provider = (
+        HttpMarketDataProvider(
+            market_data_endpoint,
+            bearer_token=os.environ.get("SPEAKING_AGENT_MARKET_DATA_TOKEN"),
+            timeout_seconds=float(
+                os.environ.get("SPEAKING_AGENT_MARKET_DATA_TIMEOUT_SECONDS", "5")
+            ),
+        )
+        if market_data_endpoint
+        else None
+    )
+    lead_workflow_endpoint = os.environ.get("SPEAKING_AGENT_LEAD_WORKFLOW_URL")
+    lead_workflow_sink = (
+        WebhookLeadWorkflowSink(
+            lead_workflow_endpoint,
+            bearer_token=os.environ.get("SPEAKING_AGENT_LEAD_WORKFLOW_TOKEN"),
+            timeout_seconds=float(
+                os.environ.get("SPEAKING_AGENT_LEAD_WORKFLOW_TIMEOUT_SECONDS", "5")
+            ),
+        )
+        if lead_workflow_endpoint
+        else None
+    )
     audio_recorder = None
     recording_error: PermissionError | None = None
     if campaign.behavior["recording_enabled"]:
@@ -176,6 +210,7 @@ async def entrypoint(context: JobContext) -> None:
         transfer_available=bool(transfer_to),
         conversation_context=conversation_context,
         audio_recorder=audio_recorder,
+        market_data_provider=market_data_provider,
     )
     legacy_retention = os.environ.get("SPEAKING_AGENT_LEGACY_RETENTION_DAYS")
     repository = SQLiteCallRepository(
@@ -344,15 +379,36 @@ async def entrypoint(context: JobContext) -> None:
                 phone_number,
                 session.conversation.state.call_id,
             )
-        await repository.save(
-            completed_call_record(
-                session,
-                result,
-                connection_result=connection_result,
-                duration_seconds=time.perf_counter() - started_at,
-                phone_number_masked=masked_number,
-            )
+        record = completed_call_record(
+            session,
+            result,
+            connection_result=connection_result,
+            duration_seconds=time.perf_counter() - started_at,
+            phone_number_masked=masked_number,
         )
+        await repository.save(record)
+        if lead_workflow_sink is not None and result.answer_kind.value == "HUMAN":
+            try:
+                await lead_workflow_sink.publish(
+                    LeadWorkflowEvent(
+                        call_id=record.call_id,
+                        campaign_id=record.campaign_id,
+                        owner_name=conversation_context.recipient_name,
+                        phone_number=phone_number,
+                        phone_number_masked=record.phone_number_masked,
+                        analysis=SalesCallAnalysis.from_dict(
+                            record.sales_summary,
+                            summary_text=record.summary,
+                        ),
+                        transcript=record.transcript,
+                        recording_url=record.recording_url,
+                    )
+                )
+            except LeadDeliveryError:
+                logger.exception(
+                    "lead workflow delivery failed for call %s",
+                    record.call_id,
+                )
     finally:
         try:
             await repository.close()

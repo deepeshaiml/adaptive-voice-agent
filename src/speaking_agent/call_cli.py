@@ -24,6 +24,9 @@ def _conversation_context(args: argparse.Namespace) -> ConversationContext:
         known_fields={
             name: value
             for name, value in (
+                ("project", args.project),
+                ("cluster", args.cluster),
+                ("bedrooms", args.bedrooms),
                 ("property_location", args.property_location),
                 ("property_type", args.property_type),
             )
@@ -99,6 +102,9 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--room")
     parser.add_argument("--recipient-name")
     parser.add_argument("--property-reference")
+    parser.add_argument("--project")
+    parser.add_argument("--cluster")
+    parser.add_argument("--bedrooms")
     parser.add_argument("--property-location")
     parser.add_argument("--property-type")
     parser.add_argument(

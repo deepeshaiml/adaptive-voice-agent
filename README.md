@@ -18,7 +18,7 @@ operator. The command is implemented but deliberately blocked without all three.
 
 ## Current Status
 
-Status last verified on **2026-08-16** on Apple-silicon macOS with Python 3.12:
+Status last verified on **2026-08-20** on Apple-silicon macOS with Python 3.12:
 
 | Area | Status |
 |---|---|
@@ -30,9 +30,11 @@ Status last verified on **2026-08-16** on Apple-silicon macOS with Python 3.12:
 | LiveKit room audio | Verified bidirectionally |
 | Outbound SIP/PSTN | Implemented behind controlled-call gates; real PSTN not yet exercised |
 | SQLite outcomes, suppression, retention, and metrics | Complete and tested |
+| DAMAC seller summaries, P1-P4 follow-ups, and lead webhook | Implemented and unit tested; external CRM not exercised |
+| Approved market-data gateway | Implemented and unit tested; provider credentials/feed not supplied |
 | Linux, Windows, CUDA, and portable inference | Not yet integrated or natively verified |
 
-The current validation passes **230 tests**, `pip check`, bytecode compilation, diff
+The current validation passes **256 tests**, `pip check`, bytecode compilation, diff
 validation, local Markdown-link checks, and editor diagnostics. A real local Qwen
 planning smoke completed in 1.214 seconds for one warm single-turn scenario; this is a
 smoke measurement, not a P50/P95 benchmark. Independent blocker review found no release
@@ -55,9 +57,11 @@ Campaign JSON ---> ConversationPolicy ---> CallSession
                          |                    ^
                          v                    |
                     LeadOutcome        mock / MLX adapters
-                         |
-                         v
-                  CallRepository ---> SQLite
+                      |
+                      +----> MarketDataProvider ---> approved API/feed gateway
+                      |
+                      v
+                     CallRepository ---> SQLite ---> LeadWorkflowSink ---> CRM/Yasir
 ```
 
 The domain, policy, conversation, and call lifecycle own application types. They do not
@@ -181,31 +185,39 @@ For telephone-like conversation, use full-duplex mode:
 .venv/bin/adaptive-voice-local --full-duplex
 ```
 
-To practice the personalized three-stage opening with fake data:
+To practice the personalized three-stage opening with fake DAMAC data:
 
 ```sh
 .venv/bin/adaptive-voice-local --full-duplex --demo-metadata
 ```
 
-That demo identifies the disclosed automated assistant as Sam, asks for Mr. Ahmed,
-mentions a fake apartment in Marina Gate only after recipient confirmation, asks whether
-it is a good time, and then starts qualification. The safe default remains the generic
-opening when metadata is omitted.
+That demo identifies the disclosed AI assistant, asks for Mr. Ahmed, mentions a fake
+4-bedroom townhouse in Nice only after recipient confirmation, asks whether it is a good
+time, and then starts qualification. NeoAI is the caller; Yasir is the human who receives
+the post-call lead. When the two loopback demo services below are running,
+`--demo-metadata` automatically reads fictional market data from port `8765`, uses the
+fixed fake number `+971500000000`, and sends Yasir's notification to port `8766` only
+after the conversation reaches its closing outcome. The terminal then prints
+`Yasir notification sent`. The configured campaign opening is used when metadata is
+omitted.
 
 Supply reviewed metadata explicitly when it becomes available:
 
 ```sh
 .venv/bin/adaptive-voice-local --full-duplex \
   --recipient-name "Ms. Fatima" \
-  --property-reference "your villa in Dubai Hills" \
-  --property-location "Dubai Hills Estate" \
-  --property-type villa
+  --property-reference "your townhouse in Malta, DAMAC Lagoons" \
+  --phone-number "+971501234567" \
+  --project "DAMAC Lagoons" --cluster Malta --bedrooms 4 \
+  --property-type townhouse
 ```
 
-Recipient name and property reference must be supplied together. They stay in the
-in-memory conversation context and are not added to persisted call records. Verified
-structured fields such as location/type seed conversation state and may therefore appear
-in the structured outcome. Never populate metadata from an unverified enrichment source.
+Recipient name and property reference must be supplied together. The reference gates the
+personalized opening; the recipient name and verified structured fields may appear in the
+retained call summary. Never populate metadata from an unverified enrichment source, and
+apply the same access and deletion policy used for transcripts and call outcomes.
+`--phone-number` must use E.164 format and is sent only to a configured lead workflow;
+omit it when that workflow does not need a WhatsApp action.
 
 ### Consent-Gated Audio Recording
 
@@ -327,6 +339,122 @@ The worker receives 16 kHz mono PCM, detects turns, supports barge-in by cancell
 and clearing the LiveKit audio queue, publishes 24 kHz mono PCM, waits for playout before
 hangup/transfer, and releases all session resources on exit.
 
+### Complete Local Demo
+
+The repository includes a loopback-only fake stack for development without DLD, portal,
+CRM, WhatsApp, LiveKit, or PSTN credentials. Use only fake owners and controlled test
+numbers. Every market response begins with `FICTIONAL DEMO DATA`, uses `DEMO ONLY`
+sources, and is rejected automatically when `controlled_test_mode` is false.
+
+Start the fictional market service:
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/demo_market_data_server.py
+```
+
+It serves three fixtures: Nice 4BR townhouse, Malta 4BR townhouse, and Venice 6BR villa.
+Unknown combinations return no comparables instead of fabricated fallback prices.
+
+In a second terminal, start the local Yasir/CRM receiver:
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/demo_lead_workflow_server.py
+```
+
+It prints a compact Yasir notification, deduplicates by `call_id`, and appends the full
+event to the owner-only ignored file `data/demo/lead_events.jsonl`. The latest received
+event is available locally at `http://127.0.0.1:8766/latest`; the latest event that
+actually requires a Yasir alert remains available at
+`http://127.0.0.1:8766/latest-yasir`. Unqualified and not-interested calls are stored but
+do not replace that alert view.
+
+With both services running, start the real local Qwen voice conversation:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m speaking_agent.local_voice_chat \
+  --full-duplex --demo-metadata
+```
+
+Answer the recipient and timing confirmations, complete the seller questions, and let
+the agent deliver its closing line. The latest Yasir event changes only when the call is
+complete; stopping with `Ctrl-C` before a final outcome does not create a lead.
+For the identity question, say `Yes` or `Yes, speaking`; `Okay` is only an acknowledgement
+and intentionally does not unlock the private property-reference step.
+
+Alternatively, run a complete synthetic hot-seller flow without microphone or models:
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/demo_sales_flow.py \
+  --call-id demo-nice-hot-seller-1
+```
+
+Change `--call-id` to create another event. To connect the running LiveKit worker to the
+same fake services for a controlled call, configure:
+
+```text
+SPEAKING_AGENT_MARKET_DATA_URL=http://127.0.0.1:8765/comparables
+SPEAKING_AGENT_LEAD_WORKFLOW_URL=http://127.0.0.1:8766/events
+```
+
+The WhatsApp action is only a generated `wa.me` link and only appears after explicit
+permission and number confirmation. The demo receiver never sends a WhatsApp message.
+Do not expose either server beyond loopback or use its fictional evidence in a real owner
+conversation.
+
+### Approved Market Data
+
+Set `SPEAKING_AGENT_MARKET_DATA_URL` to an internal HTTPS gateway backed by approved DLD,
+Property Monitor, REIDIN, or brokerage listing feeds. The application does not scrape
+Property Finder or Bayut. It sends `project`, `cluster`, `bedrooms`, `property_type`, and
+`months` as query parameters after the comparable property is identified. An optional
+bearer token comes from `SPEAKING_AGENT_MARKET_DATA_TOKEN`.
+
+The gateway response is normalized so completed sales cannot be confused with asking
+prices:
+
+```json
+{
+  "actual_transactions": {
+    "source": "Dubai Land Department",
+    "as_of": "2026-08-20",
+    "count": 9,
+    "low_aed": 3550000,
+    "high_aed": 3950000,
+    "median_aed": 3750000
+  },
+  "current_listings": {
+    "source": "Approved brokerage feed",
+    "as_of": "2026-08-20",
+    "count": 12,
+    "low_aed": 3850000,
+    "high_aed": 4200000,
+    "median_aed": 4000000
+  },
+  "confidence": "high"
+}
+```
+
+Either evidence section may be omitted, but source and `as_of` are mandatory when it is
+present. Remote endpoints must use HTTPS. Missing or failed market data never becomes a
+model-generated estimate; qualification continues without the unavailable evidence.
+
+### CRM And Yasir Notification
+
+Set `SPEAKING_AGENT_LEAD_WORKFLOW_URL` to an authorized HTTPS webhook. After each
+connected human call, the worker first stores the call record and then posts the full
+structured summary, transcript when enabled, recording URL when available, P1-P4
+priority, follow-up timestamp/task flag, recommended action, and notification mode.
+
+P1 hot sellers and P2 owners open at the right price set `notify_yasir=true` with
+`notification_mode=IMMEDIATE`. P3 potential sellers use `MARKET_FOLLOW_UP`. P4 future
+sellers create a dated follow-up task without an urgent notification. Qualified events
+include an `open_whatsapp_url` only after the owner grants permission and confirms the
+called number. The raw number is sent only to the
+configured workflow endpoint and is not persisted in SQLite; stored records retain the
+masked number. A failed webhook is logged and does not delete or roll back the call
+record. Production deployments should place the endpoint behind a durable CRM/outbox
+with authentication, retry, idempotency by `call_id`, and role-based access.
+
 ## Controlled Calls
 
 Outbound calling is restricted to controlled tests. Configure:
@@ -358,9 +486,9 @@ enabled:
 PYTHONPATH=src .venv/bin/python -m speaking_agent.call_cli \
   +<controlled-number> \
   --recipient-name "Mr. Ahmed" \
-  --property-reference "your apartment in Marina Gate" \
-  --property-location "Dubai Marina" \
-  --property-type apartment
+  --property-reference "your townhouse in Nice, DAMAC Lagoons" \
+  --project "DAMAC Lagoons" --cluster Nice --bedrooms 4 \
+  --property-type townhouse
 ```
 
 For a controlled LiveKit/SIP recording, first set `behavior.recording_enabled` to `true`
@@ -403,12 +531,16 @@ PYTHONPATH=src .venv/bin/python -m speaking_agent.operator_cli show <call-id>
 PYTHONPATH=src .venv/bin/python -m speaking_agent.operator_cli metrics
 ```
 
-SQLite defaults to `data/speaking_agent.db`. Records include connection result, answer
-kind, lead outcome, validated fields, interruption count, duration, and latency metrics.
-They do not contain transcripts or raw telephone numbers. Do-not-contact and attempt
-tracking use a keyed HMAC fingerprint. Structured call records and attempt history are
-assigned per-row expirations using their campaign's `data_retention_days`; recording
-manifests use the same campaign horizon, while suppression entries are retained. Run the
+SQLite defaults to `data/speaking_agent.db`. Records include the mandatory sectioned
+seller summary, P1-P4 priority, follow-up timestamp, validated property/price/WhatsApp
+fields, market evidence discussed, connection data, duration, and latency metrics.
+Campaigns may opt into full transcript persistence with `behavior.transcript_enabled`;
+the DAMAC campaign enables it and includes a transcription notice. Transcripts and local
+recording references use the same protected row and campaign retention horizon. Raw
+telephone numbers are never persisted. Do-not-contact and attempt tracking use a keyed
+HMAC fingerprint. Structured call records and attempt history are assigned per-row
+expirations using their campaign's `data_retention_days`; recording manifests use the
+same campaign horizon, while suppression entries are retained. Run the
 retention service beside the call worker so expired structured rows, recording WAVs, and
 manifests are removed even while no calls are arriving:
 
@@ -438,13 +570,15 @@ contains property-domain evidence rules for fields such as intent, location, pro
 type, price, timeline, and listing state. Add a pluggable or declarative domain policy
 before treating JSON alone as sufficient for a non-property campaign.
 
-The active local voice campaign is `campaigns/property_owner.json`. That is where you
+The default simulator, local voice, and LiveKit campaign is
+`campaigns/neoai_property_owner.json`. That is where you
 give the agent its overall goal and flexible scenario guidance:
 
 The repository includes two examples:
 
-- `campaigns/property_owner.json`: detailed adaptive property campaign.
-- `campaigns/neoai_property_owner.json`: compact NeoAI-branded campaign.
+- `campaigns/neoai_property_owner.json`: DAMAC Lagoons seller qualification, market
+  feedback, WhatsApp/document permission, and Yasir follow-up.
+- `campaigns/property_owner.json`: legacy generic sell/rent property campaign.
 
 ```json
 {
@@ -476,20 +610,21 @@ appending the next qualification question, such as identity clarification or a c
 about repetition. Compliant `opening_variants` are selected per session so repeated calls
 do not always begin with identical wording.
 
-The detailed property campaign includes conditional guidance for owners who already use
-an agent, request WhatsApp, ask about a buyer or valuation, state a high expected price,
-or volunteer tenant/rental timing. These are strategies rather than scripts. They do not
-grant new tools: the example cannot send WhatsApp, inspect transactions, calculate a live
-valuation, or verify a buyer. It states those limits instead of promising work it cannot
-perform. An explicit refusal ends the call without further probing, and an explicit
-future-contact refusal additionally enters do-not-contact suppression.
+The DAMAC campaign pursues selling intention, exact unit details, asking/minimum price,
+grounded market feedback, WhatsApp permission, documents, and Yasir follow-up in that
+order without treating the questions as a literal script. `field_dependencies` suppress
+WhatsApp number and document questions when permission is declined. Market and outbound
+workflow capabilities exist only when their approved endpoints are configured. An
+explicit refusal ends the call without further probing, and an explicit future-contact
+refusal additionally enters do-not-contact suppression.
 
 During a session, the model receives bounded in-memory dialogue history for both the
 owner and agent, plus the current stage, prior question counts, skipped fields, and known
 structured facts. This lets it resolve references, remember what both sides said, and
 avoid repeating an earlier answer or question. Configure the owner-turn bound with
-`behavior.conversation_memory_turns` (default `12`). This in-call history is discarded
-when the session ends and is never written to SQLite call records.
+`behavior.conversation_memory_turns` (default `12`). This prompt window remains bounded.
+The independent full dialogue is written to the retained call record only when
+`behavior.transcript_enabled` is true.
 
 To create another campaign:
 
@@ -499,7 +634,9 @@ To create another campaign:
    field.
 4. Configure hard stops, FAQs, prohibited statements, terminal/closing behavior,
    voicemail text, attempt limits, retention, and model failure bounds.
-  Set `recording_enabled` explicitly. `true` enables dual-channel recording only when
+    Set `transcript_enabled` explicitly and include the reviewed notice/consent language
+    required for the deployment. Set `recording_enabled` explicitly. `true` enables
+    dual-channel recording only when
   each controlled dispatch also carries a valid consent reference; otherwise the call
   is blocked before dialing.
 5. Keep `controlled_test_mode` enabled for controlled tests. Before disabling it, add a
@@ -536,7 +673,9 @@ outside the model.
 | Change endpointing, short-speech handling, or local audio | `src/speaking_agent/turn_detection.py`, `src/speaking_agent/local_voice_chat.py`, `src/speaking_agent/adapters/telephony/sounddevice_local.py` | Tune from captured consented scenarios; keep device/sample-rate behavior explicit | Audio evidence shows missed speech, false turns, echo, or latency problems |
 | Change call lifecycle, barge-in, transfer, or cleanup | `src/speaking_agent/voice_session.py`, `src/speaking_agent/transport.py` | Keep one `CallSession` owner and bounded cancellation/cleanup | Behavior must be identical across local and LiveKit transports |
 | Change LiveKit or controlled outbound SIP | `src/speaking_agent/livekit_worker.py`, `src/speaking_agent/adapters/telephony/livekit_room.py`, `src/speaking_agent/call_cli.py`, `src/speaking_agent/outbound.py` | Keep SDK/SIP types inside adapters and preserve allowlist/suppression gates | Provider behavior or controlled-call requirements change |
-| Change persistence, privacy, retention, or metrics | `src/speaking_agent/records.py`, `src/speaking_agent/recording.py`, `src/speaking_agent/suppression.py`, `src/speaking_agent/adapters/storage/sqlite.py`, `src/speaking_agent/metrics.py` | Migrate explicitly, retain no raw number/transcript, and preserve atomic attempt checks | The structured record contract or reviewed retention policy changes |
+| Change market-data integration | `src/speaking_agent/market_data.py`, composition entry points | Preserve the normalized actual-transaction/current-listing distinction and approved HTTPS feeds | A reviewed provider or internal mapping service is available |
+| Change lead classification/CRM delivery | `src/speaking_agent/lead_workflow.py`, `src/speaking_agent/livekit_worker.py` | Keep raw numbers transient, use `call_id` idempotency, and preserve P1-P4/task semantics | CRM or notification requirements change |
+| Change persistence, privacy, retention, or metrics | `src/speaking_agent/records.py`, `src/speaking_agent/recording.py`, `src/speaking_agent/suppression.py`, `src/speaking_agent/adapters/storage/sqlite.py`, `src/speaking_agent/metrics.py` | Migrate explicitly, keep raw numbers out, gate transcripts by campaign, and preserve atomic attempt checks | The structured record contract or reviewed retention policy changes |
 | Change consented audio capture or recording retention | `src/speaking_agent/audio_recording.py`, `src/speaking_agent/voice_session.py`, transports, `src/speaking_agent/retention_worker.py` | Preserve explicit per-call consent, private dual-channel artifacts, transport-confirmed playout, and expiry manifests | A reviewed quality/training workflow changes |
 | Change operator workflows | `src/speaking_agent/operator_cli.py`, `src/speaking_agent/retention_worker.py` | Add commands over repository interfaces rather than direct SQL | Operators need a repeatable inspection or maintenance action |
 
@@ -618,3 +757,5 @@ audio hardware, LiveKit, or telephony.
   recording, calling times, retention, transfer, and suppression rules.
 - No queue, broker, microservice split, retry farm, or multi-machine deployment is added;
   the current requirement is one process and one controlled call.
+- DLD/Property Monitor/listing credentials and exact identifier mappings were not
+  supplied, so live market accuracy and external webhook delivery remain unverified.

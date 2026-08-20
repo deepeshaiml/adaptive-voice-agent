@@ -46,6 +46,8 @@ async def run(args: argparse.Namespace) -> int:
                 "connection_result": record.connection_result,
                 "outcome": record.outcome,
                 "qualified": record.qualified,
+                "priority": record.priority,
+                "follow_up_at": record.follow_up_at,
                 "phone_number": record.phone_number_masked,
                 "disconnected": record.disconnected,
                 "duration_seconds": record.duration_seconds,

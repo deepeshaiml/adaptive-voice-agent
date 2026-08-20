@@ -27,7 +27,7 @@ retained for compatibility.
 
 Current verified state:
 
-* 230 unit, conversation, lifecycle, storage, and adapter tests pass;
+* 256 unit, conversation, lifecycle, storage, adapter, and demo-integration tests pass;
 * local Qwen LLM, Qwen3-ASR, and Qwen3-TTS run on Apple-silicon MLX/Metal;
 * text, WAV, microphone/speaker, half-duplex, speaker, and experimental full-duplex
   conversation paths are implemented;
